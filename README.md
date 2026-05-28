@@ -2,6 +2,8 @@
 
 Performance benchmarking tool for LLM Serving backends with multi-turn long-context workloads.
 
+[中文文档](README_CN.md)
+
 Built on [EvalScope](https://github.com/modelscope/evalscope)'s perf infrastructure, adding:
 
 - **Multi-turn context model**: System Prefix + User Prefix + History + Current Input
@@ -174,6 +176,33 @@ Results are saved as JSON with:
   "timeline": [ ... ]
 }
 ```
+
+## Testing Philosophy
+
+ClawPerfBench is designed to simulate the **real workload of an Agent system** — not single-shot API calls, but sustained multi-turn conversations that push LLM serving backends to their limits.
+
+### Why multi-turn matters
+
+Real Agent systems (like OpenClaw) don't send one-off requests. They maintain long conversations: a system prompt, user-specific context, and growing history. Each turn re-sends the entire accumulated context, creating exponentially growing prompts. This is fundamentally different from single-request benchmarks and exposes backend behaviors that single-shot tests miss:
+
+- **Prefix cache effectiveness**: Does the KV-block cache actually reuse tokens across turns? A single-request benchmark can't measure this.
+- **Compaction under load**: When context hits the window limit, how does the system handle truncation? Does it recover gracefully or spiral into overflow?
+- **Latency degradation**: As context grows from 25K to 200K tokens, TTFT and TPOT change dramatically. Per-turn metrics reveal this progression.
+- **Concurrent pressure**: Multiple users with independent conversations create mixed prefix cache states — some sharing the system prefix, others diverging at user-specific paths.
+
+### Simulating real users
+
+Each simulated user maintains an independent conversation state with its own growing prefix and history. Users arrive according to configurable patterns (burst, steady, Poisson) — mimicking how real traffic builds up, not an artificial flood of identical requests.
+
+### What we measure
+
+| What | Why it matters |
+|------|---------------|
+| TTFT per turn | First-token latency grows with context size — the key UX metric for Agent systems |
+| TPOT per turn | Generation speed should stay stable; degradation indicates compute bottlenecks |
+| Prefix cache hit rate | Token-level reuse fraction across turns — the efficiency metric for KV caching |
+| Compaction events | When and how often context overflows — determines conversation continuity |
+| Per-user breakdown | Different users have different prefix paths; aggregate stats hide per-user variance |
 
 ## Context Model
 
