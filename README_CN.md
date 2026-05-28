@@ -1,6 +1,13 @@
 # ClawPerfBench
 
+[![PyPI 版本](https://img.shields.io/pypi/v/clawperf.svg)](https://pypi.org/project/clawperf/)
+[![Python 版本](https://img.shields.io/pypi/pyversions/clawperf.svg)](https://pypi.org/project/clawperf/)
+[![许可证](https://img.shields.io/pypi/l/clawperf.svg)](https://github.com/Potterluo/ClawPerf/blob/main/LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/Potterluo/ClawPerf.svg)](https://github.com/Potterluo/ClawPerf)
+
 面向 LLM Serving 后端（vLLM、SGLang、MindIE）的多轮长上下文性能基准测试工具。
+
+[English Documentation](README.md)
 
 基于 [EvalScope](https://github.com/modelscope/evalscope) 的 perf 基础设施构建，扩展了：
 
