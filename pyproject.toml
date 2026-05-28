@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clawperf"
+dynamic = ["version"]
+description = "Performance benchmarking tool for LLM Serving backends with multi-turn long-context workloads"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    {name = "ClawPerf Contributors"},
+]
+keywords = ["llm", "benchmark", "perf", "vllm", "sglang", "mindie", "evalscope"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Benchmark",
+]
+dependencies = [
+    "aiohttp>=3.9",
+    "tiktoken>=0.5",
+    "evalscope>=1.0",
+    "modelscope>=1.0",
+    "transformers>=4.36",
+    "prettytable>=3.10",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+mock-server = ["fastapi>=0.100", "uvicorn>=0.20"]
+dev = ["pytest>=7", "pytest-asyncio>=0.21", "ruff>=0.1"]
+
+[project.urls]
+Homepage = "https://github.com/Potterluo/ClawPerf"
+Repository = "https://github.com/Potterluo/ClawPerf"
+Issues = "https://github.com/Potterluo/ClawPerf/issues"
+
+[project.scripts]
+clawperf = "clawperf.cli:main"
+clawperf-mock-server = "clawperf.mock_server:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "clawperf.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

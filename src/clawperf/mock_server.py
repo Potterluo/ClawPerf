@@ -1,0 +1,415 @@
+"""Mock LLM API server for ClawPerf testing.
+
+Simulates realistic LLM serving behavior:
+- Token-by-token streaming with configurable inter-token delay (TPOT)
+- Configurable first-token delay (TTFT)
+- Respects max_tokens and ignore_eos from request
+- OpenAI-compatible API format
+- vLLM-compatible /metrics Prometheus endpoint with prefix cache counters
+- Trie-based prefix cache simulation for realistic multi-turn hit rates
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import threading
+import time
+import uuid
+from typing import AsyncGenerator
+
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
+
+app = FastAPI(title="ClawPerf Mock LLM", version="2.0.0")
+
+SUPPORTED_MODELS = ["gpt-3.5-turbo", "qwen3-32b", "claude-3-opus", "deepseek-r1"]
+
+# ── Defaults ──
+TTFT_MS = 500
+TPOT_MS = 10
+CHARS_PER_TOKEN = 4
+
+_defaults = {
+    "ttft_ms": TTFT_MS,
+    "tpot_ms": TPOT_MS,
+}
+
+FILLER_TEXT = (
+    "The quick brown fox jumps over the lazy dog. "
+    "In a world of constant change, the ability to adapt and learn becomes paramount. "
+    "Technology continues to reshape our understanding of what is possible, "
+    "pushing the boundaries of human achievement further than ever before. "
+    "Each new discovery opens doors to possibilities previously unimagined, "
+    "creating a cascade of innovation that transforms entire industries. "
+    "The integration of artificial intelligence into daily workflows "
+    "represents one of the most significant shifts in how we approach problem-solving. "
+    "As these systems become more sophisticated, they enable us to tackle "
+    "increasingly complex challenges with greater efficiency and precision. "
+    "The future holds immense promise for those who embrace continuous learning "
+    "and remain open to the transformative potential of emerging technologies. "
+)
+
+
+class PrefixCacheTrie:
+    """Trie-based prefix cache simulation for realistic multi-turn hit rates.
+
+    Each message content is hashed into a "chunk". Walking the trie with a
+    request's message sequence finds the longest cached prefix — matching how
+    vLLM's KV-block prefix cache works at the semantic level.
+    """
+
+    def __init__(self, max_prefixes: int = 200):
+        self._root: dict = {}
+        self._token_counts: dict[str, int] = {}
+        self._max_prefixes = max_prefixes
+        self._num_prefixes = 0
+        self._insert_order: list[str] = []  # track insertion order for eviction
+
+    def query(self, chunks: list[tuple[str, int]]) -> int:
+        """Walk the trie and return the number of matched tokens."""
+        node = self._root
+        matched_tokens = 0
+        for chunk_hash, tok_count in chunks:
+            if chunk_hash in node:
+                node = node[chunk_hash]
+                matched_tokens += tok_count
+            else:
+                break
+        return matched_tokens
+
+    def _evict_oldest(self):
+        """Remove the oldest leaf path from the trie to stay within max_prefixes."""
+        while self._num_prefixes > self._max_prefixes and self._insert_order:
+            oldest = self._insert_order.pop(0)
+            # Walk the trie and remove this hash from its parent node
+            # Only remove if it's a leaf (empty children dict) or shallow branch
+            self._remove_hash(oldest)
+            self._token_counts.pop(oldest, None)
+            self._num_prefixes -= 1
+
+    def _remove_hash(self, chunk_hash: str):
+        """Remove a chunk_hash from the trie by walking all paths and pruning."""
+        stack = [(self._root, None, None)]  # (node, parent, key_in_parent)
+        to_remove = []
+        while stack:
+            node, parent, key = stack.pop()
+            for k, child in node.items():
+                if k == chunk_hash:
+                    to_remove.append((node, k))
+                stack.append((child, node, k))
+        for node, k in to_remove:
+            child = node[k]
+            # Only remove if child has no sub-children (leaf or shallow)
+            if not child:
+                del node[k]
+
+    def insert(self, chunks: list[tuple[str, int]]) -> bool:
+        """Insert a full prompt sequence into the trie. Returns True if eviction happened."""
+        evicted = False
+        node = self._root
+        for chunk_hash, tok_count in chunks:
+            if chunk_hash not in node:
+                node[chunk_hash] = {}
+                self._num_prefixes += 1
+                self._token_counts[chunk_hash] = tok_count
+                self._insert_order.append(chunk_hash)
+            node = node[chunk_hash]
+        if self._num_prefixes > self._max_prefixes:
+            self._evict_oldest()
+            evicted = True
+        return evicted
+
+
+# ── Metrics counters (thread-safe) ──
+_metrics_lock = threading.Lock()
+_metrics_counters = {
+    "prefix_cache_queries": 0,
+    "prefix_cache_evictions": 0,
+    "prefix_cache_hit_tokens": 0,
+    "prefix_cache_query_tokens": 0,
+    "external_prefix_cache_queries": 0,
+    "external_prefix_cache_hit_tokens": 0,
+    "external_prefix_cache_query_tokens": 0,
+    "requests_total": 0,
+    "requests_running": 0,
+    "requests_waiting": 0,
+    "prompt_tokens_total": 0,
+    "generation_tokens_total": 0,
+}
+_hbm_trie = PrefixCacheTrie()
+_ext_trie = PrefixCacheTrie()
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // CHARS_PER_TOKEN)
+
+
+def _messages_to_chunks(messages: list) -> list[tuple[str, int]]:
+    """Convert a messages list into trie chunks: (content_hash, estimated_tokens)."""
+    chunks = []
+    for m in messages:
+        content = m.get("content", "")
+        chunks.append((hash(content), _estimate_tokens(content)))
+    return chunks
+
+
+def _generate_content(messages: list, max_tokens: int) -> str:
+    """Generate filler content targeting ~max_tokens tokens."""
+    last_content = messages[-1].get("content", "")[:50] if messages else "Hello"
+    target_chars = max_tokens * CHARS_PER_TOKEN
+    response = last_content
+    if len(response) < target_chars:
+        filler_needed = target_chars - len(response)
+        cycles = (filler_needed // len(FILLER_TEXT)) + 1
+        response += " " + (FILLER_TEXT * cycles)[:filler_needed]
+    return response
+
+
+def _update_metrics_on_request(messages: list, model: str):
+    """Simulate HBM + external prefix cache using trie-based prefix matching."""
+    with _metrics_lock:
+        _metrics_counters["requests_total"] += 1
+        prompt_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
+        _metrics_counters["prompt_tokens_total"] += prompt_tokens
+
+        chunks = _messages_to_chunks(messages)
+
+        # HBM prefix cache: query trie for longest matching prefix
+        _metrics_counters["prefix_cache_queries"] += 1
+        _metrics_counters["prefix_cache_query_tokens"] += prompt_tokens
+        hit_tokens = _hbm_trie.query(chunks)
+        if hit_tokens > 0:
+            _metrics_counters["prefix_cache_hit_tokens"] += hit_tokens
+        else:
+            # External prefix cache: query trie on HBM miss
+            _metrics_counters["external_prefix_cache_queries"] += 1
+            _metrics_counters["external_prefix_cache_query_tokens"] += prompt_tokens
+            ext_hit_tokens = _ext_trie.query(chunks)
+            if ext_hit_tokens > 0:
+                _metrics_counters["external_prefix_cache_hit_tokens"] += ext_hit_tokens
+
+        # Always insert into both trie instances (simulates vLLM storing all KV blocks after request)
+        _ext_trie.insert(chunks)
+        evicted = _hbm_trie.insert(chunks)
+        if evicted:
+            _metrics_counters["prefix_cache_evictions"] += 1
+
+
+def _update_metrics_on_complete(output_tokens: int):
+    """Update metrics when a request completes."""
+    with _metrics_lock:
+        _metrics_counters["generation_tokens_total"] += output_tokens
+
+
+def make_chunk(
+    id: str, model: str, content: str = "", finish: bool = False, usage: dict | None = None
+) -> str:
+    choice = {
+        "index": 0,
+        "delta": {"content": content} if content else {},
+        "finish_reason": "stop" if finish else None,
+    }
+    data = {
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [choice],
+    }
+    if usage is not None:
+        data["usage"] = usage
+    return f"data: {json.dumps(data)}\n\n"
+
+
+async def stream_response(
+    messages: list,
+    model: str,
+    max_tokens: int,
+    ignore_eos: bool = True,
+    ttft_ms: float = TTFT_MS,
+    tpot_ms: float = TPOT_MS,
+) -> AsyncGenerator[str, None]:
+    """Stream tokens one-by-one with realistic TTFT + TPOT delays."""
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    content = _generate_content(messages, max_tokens)
+    input_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
+    output_tokens = _estimate_tokens(content)
+
+    # TTFT: wait before first token
+    await asyncio.sleep(ttft_ms / 1000)
+
+    # Role chunk
+    yield make_chunk(chunk_id, model)
+
+    # Token-by-token streaming (1 token ≈ CHARS_PER_TOKEN chars per chunk)
+    for i in range(0, len(content), CHARS_PER_TOKEN):
+        chunk_content = content[i : i + CHARS_PER_TOKEN]
+        yield make_chunk(chunk_id, model, content=chunk_content)
+        # TPOT delay between tokens
+        await asyncio.sleep(tpot_ms / 1000)
+
+    # Final chunk with usage
+    usage = {
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    yield make_chunk(chunk_id, model, finish=True, usage=usage)
+    yield "data: [DONE]\n\n"
+
+    _update_metrics_on_complete(output_tokens)
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    data = await request.json()
+    model = data.get("model", "gpt-3.5-turbo")
+    stream = data.get("stream", False)
+    messages = data.get("messages", [])
+    max_tokens = data.get("max_tokens", 10)
+    ignore_eos = data.get("ignore_eos", True)
+    # Allow per-request override of latency via extra_body
+    extra = data.get("extra_body", {}) or {}
+    req_ttft = extra.get("mock_ttft_ms", _defaults["ttft_ms"])
+    req_tpot = extra.get("mock_tpot_ms", _defaults["tpot_ms"])
+
+    if model not in SUPPORTED_MODELS:
+        model = "test-model"
+
+    _update_metrics_on_request(messages, model)
+
+    if stream:
+        return StreamingResponse(
+            stream_response(messages, model, max_tokens, ignore_eos, req_ttft, req_tpot),
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming: still simulate TTFT + total time
+    await asyncio.sleep(req_ttft / 1000 + req_tpot * max_tokens / 1000)
+    content = _generate_content(messages, max_tokens)
+    input_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
+    output_tokens = _estimate_tokens(content)
+    _update_metrics_on_complete(output_tokens)
+
+    return JSONResponse({
+        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        },
+    })
+
+
+@app.get("/metrics")
+async def metrics():
+    """vLLM-compatible Prometheus metrics endpoint."""
+    with _metrics_lock:
+        c = dict(_metrics_counters)
+
+    lines = [
+        "# HELP vllm:num_requests_running Number of requests currently running.",
+        f"# TYPE vllm:num_requests_running gauge",
+        f"vllm:num_requests_running{{model_name=\"mock\"}} {c['requests_running']}",
+        "",
+        "# HELP vllm:num_requests_waiting Number of requests waiting to be processed.",
+        f"# TYPE vllm:num_requests_waiting gauge",
+        f"vllm:num_requests_waiting{{model_name=\"mock\"}} {c['requests_waiting']}",
+        "",
+        "# HELP vllm:gpu_cache_usage_perc GPU KV cache usage percentage.",
+        "# TYPE vllm:gpu_cache_usage_perc gauge",
+        f"vllm:gpu_cache_usage_perc{{model_name=\"mock\"}} 0.0",
+        "",
+        "# HELP vllm:prefix_cache_queries_total Total number of prefix cache queries.",
+        "# TYPE vllm:prefix_cache_queries_total counter",
+        f"vllm:prefix_cache_queries_total{{model_name=\"mock\",engine=\"0\"}} {c['prefix_cache_queries']}",
+        "",
+        "# HELP vllm:prefix_cache_evictions_total Total number of prefix cache evictions.",
+        "# TYPE vllm:prefix_cache_evictions_total counter",
+        f"vllm:prefix_cache_evictions_total{{model_name=\"mock\",engine=\"0\"}} {c['prefix_cache_evictions']}",
+        "",
+        "# HELP vllm:prefix_cache_hit_tokens_total Total tokens reused via prefix cache.",
+        "# TYPE vllm:prefix_cache_hit_tokens_total counter",
+        f"vllm:prefix_cache_hit_tokens_total{{model_name=\"mock\",engine=\"0\"}} {c['prefix_cache_hit_tokens']}",
+        "",
+        "# HELP vllm:prefix_cache_query_tokens_total Total prompt tokens queried against prefix cache.",
+        "# TYPE vllm:prefix_cache_query_tokens_total counter",
+        f"vllm:prefix_cache_query_tokens_total{{model_name=\"mock\",engine=\"0\"}} {c['prefix_cache_query_tokens']}",
+        "",
+        "# HELP external_prefix_cache_queries_total Total external prefix cache queries.",
+        "# TYPE external_prefix_cache_queries_total counter",
+        f"external_prefix_cache_queries_total{{model_name=\"mock\",engine=\"0\"}} {c['external_prefix_cache_queries']}",
+        "",
+        "# HELP external_prefix_cache_hit_tokens_total Total tokens reused via external prefix cache.",
+        "# TYPE external_prefix_cache_hit_tokens_total counter",
+        f"external_prefix_cache_hit_tokens_total{{model_name=\"mock\",engine=\"0\"}} {c['external_prefix_cache_hit_tokens']}",
+        "",
+        "# HELP external_prefix_cache_query_tokens_total Total prompt tokens queried against external prefix cache.",
+        "# TYPE external_prefix_cache_query_tokens_total counter",
+        f"external_prefix_cache_query_tokens_total{{model_name=\"mock\",engine=\"0\"}} {c['external_prefix_cache_query_tokens']}",
+        "",
+        "# HELP vllm:num_requests Total number of requests received.",
+        "# TYPE vllm:num_requests counter",
+        f"vllm:num_requests{{model_name=\"mock\"}} {c['requests_total']}",
+        "",
+        "# HELP vllm:request_prompt_tokens Total prompt tokens processed.",
+        "# TYPE vllm:request_prompt_tokens counter",
+        f"vllm:request_prompt_tokens{{model_name=\"mock\"}} {c['prompt_tokens_total']}",
+        "",
+        "# HELP vllm:request_generation_tokens Total generation tokens produced.",
+        "# TYPE vllm:request_generation_tokens counter",
+        f"vllm:request_generation_tokens{{model_name=\"mock\"}} {c['generation_tokens_total']}",
+    ]
+    return PlainTextResponse("\n".join(lines) + "\n")
+
+
+@app.get("/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {"id": m, "object": "model", "created": int(time.time()), "owned_by": "mock"}
+            for m in SUPPORTED_MODELS
+        ],
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="clawperf-mock-server",
+        description="Mock LLM API server with realistic latency simulation and vLLM metrics",
+    )
+    parser.add_argument("--port", "-p", type=int, default=8080)
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--ttft", type=float, default=500,
+                        help="First-token delay in ms (default: 500)")
+    parser.add_argument("--tpot", type=float, default=10,
+                        help="Per-token output delay in ms (default: 10)")
+    args = parser.parse_args()
+
+    _defaults["ttft_ms"] = args.ttft
+    _defaults["tpot_ms"] = args.tpot
+
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
