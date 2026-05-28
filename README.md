@@ -11,6 +11,8 @@ Built on [EvalScope](https://github.com/modelscope/evalscope)'s perf infrastruct
 - **Per-user + per-turn metrics**: TTFT, TPOT, ITL with compaction tracking
 - **Prefix cache simulation**: Trie-based HBM + external prefix cache hit rate tracking in mock server
 
+![ClawPerf Benchmark Output](docs/benchmark_result.jpg)
+
 ## Installation
 
 ```bash

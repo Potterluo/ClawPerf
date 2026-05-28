@@ -51,3 +51,7 @@ Thumbs.db
 
 # Project
 results.json
+uv.lock
+
+# Large images (use compressed jpg in docs instead)
+docs/*.png
