@@ -60,7 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Output ──
     g = parser.add_argument_group("Output")
-    g.add_argument("--output", type=str, default="results.json")
+    g.add_argument("--output", type=str, default="",
+                   help="Output JSON file path (default: timestamped results_<timestamp>.json)")
     g.add_argument("-v", "--verbose", action="store_true", default=False,
                    help="Print per-turn progress lines (default: tqdm progress bar)")
 

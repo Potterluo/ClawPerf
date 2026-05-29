@@ -50,8 +50,15 @@ ENV/
 Thumbs.db
 
 # Project
-results.json
+results*.json
 uv.lock
+
+# Claude Code / development helpers
+CLAUDE.md
+.claude/
+
+# Superpowers skill docs
+docs/superpowers/
 
 # Large images (use compressed jpg in docs instead)
 docs/*.png

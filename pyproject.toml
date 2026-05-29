@@ -25,11 +25,7 @@ classifiers = [
     "Topic :: System :: Benchmark",
 ]
 dependencies = [
-    "aiohttp>=3.9",
-    "tiktoken>=0.5",
-    "evalscope>=1.0",
-    "modelscope>=1.0",
-    "transformers>=4.36",
+    "evalscope[perf]>=1.0",
     "prettytable>=3.10",
     "tqdm>=4.60",
 ]

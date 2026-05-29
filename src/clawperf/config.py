@@ -44,7 +44,7 @@ class BenchmarkConfig:
     backend: str = "vllm"  # "vllm", "sglang", "mindie"
 
     # ── Output configuration ──
-    output: str = "results.json"
+    output: str = ""  # defaults to timestamped filename if empty
     verbose: bool = False  # per-turn detailed logging
 
     # ── Derived fields ──
@@ -54,6 +54,9 @@ class BenchmarkConfig:
     def __post_init__(self):
         if not self.tokenizer:
             self.tokenizer = self.model
+        if not self.output:
+            from datetime import datetime
+            self.output = f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         self._parse_arrival_mode()
 
     def _parse_arrival_mode(self):
