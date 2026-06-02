@@ -218,7 +218,10 @@ class BenchmarkRunner:
 
         # 7. Wait for completion
         if self._user_tasks and not self._shutdown:
-            await asyncio.gather(*self._user_tasks, return_exceptions=True)
+            results = await asyncio.gather(*self._user_tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error("User task %d failed: %s", i, result)
 
         # Snapshot metrics after all benchmark requests
         if self.system_poller and self.config.metrics_endpoint:
@@ -283,24 +286,38 @@ class BenchmarkRunner:
 
             benchmark_data = await self._http_client.post(request_body)
 
-            if benchmark_data.success:
-                benchmark_data.finalize(self._api_plugin)
+            try:
+                if benchmark_data.success:
+                    benchmark_data.finalize(self._api_plugin)
 
-            self._accumulator.update(benchmark_data, self._api_plugin)
+                self._accumulator.update(benchmark_data, self._api_plugin)
 
-            turn_record = self._build_turn_record(
-                user_id, turn_id, benchmark_data, context_tokens,
-                turn_result["compaction_triggered"],
-            )
-            self._turn_records.append(turn_record)
+                turn_record = self._build_turn_record(
+                    user_id, turn_id, benchmark_data, context_tokens,
+                    turn_result["compaction_triggered"],
+                )
+                self._turn_records.append(turn_record)
 
-            self._advance_progress(turn_record)
+                self._advance_progress(turn_record)
 
-            if not benchmark_data.success:
-                continue
+                if not benchmark_data.success:
+                    continue
 
-            ctx.append_history(self._turn_input_content, benchmark_data.generated_text)
-            await asyncio.sleep(0)
+                ctx.append_history(self._turn_input_content, benchmark_data.generated_text)
+                await asyncio.sleep(0)
+            except Exception as e:
+                logger.error("[User %02d] Turn %d: Error processing response: %s", user_id, turn_id, e)
+                # Record the error
+                error_record = {
+                    "user_id": user_id,
+                    "turn_id": turn_id,
+                    "success": False,
+                    "error_type": "processing_error",
+                    "error": str(e),
+                    "context_tokens": context_tokens,
+                }
+                self._turn_records.append(error_record)
+                self._advance_progress(error_record)
 
     def _advance_progress(self, turn_record: dict):
         """Update progress bar or print verbose turn line."""
@@ -349,12 +366,20 @@ class BenchmarkRunner:
             "compaction_triggered": compaction,
         }
 
+        # Save request details
+        if bd.request:
+            record["request"] = bd.request
+
         if bd.success:
             record["ttft_ms"] = bd.first_chunk_latency * 1000 if bd.first_chunk_latency is not None else None
             record["e2e_latency_ms"] = bd.query_latency * 1000 if bd.query_latency is not None else None
             record["tpot_ms"] = bd.time_per_output_token * 1000 if bd.time_per_output_token is not None else None
             record["input_tokens"] = bd.prompt_tokens
             record["output_tokens"] = bd.completion_tokens
+
+            # Save generated text
+            if bd.generated_text:
+                record["generated_text"] = bd.generated_text
 
             if bd.inter_chunk_latency:
                 sorted_itl = sorted(bd.inter_chunk_latency)
@@ -364,6 +389,10 @@ class BenchmarkRunner:
             record["error"] = bd.error
             record["error_type"] = classify_error(bd)
             record["status_code"] = bd.status_code
+
+            # Save error response if available
+            if bd.response_messages:
+                record["response"] = bd.response_messages
 
         return record
 

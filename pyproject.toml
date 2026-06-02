@@ -25,7 +25,7 @@ classifiers = [
     "Topic :: System :: Benchmark",
 ]
 dependencies = [
-    "evalscope[perf]>=1.0",
+    "evalscope[perf]>=1.5.0",
     "prettytable>=3.10",
     "tqdm>=4.60",
 ]

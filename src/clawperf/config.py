@@ -94,6 +94,7 @@ class BenchmarkConfig:
             total_timeout=self.request_timeout,
             api="openai",
             no_test_connection=True,
+            apply_chat_template=False,  # Disable to support tokenizers without chat_template
         )
         if self.api_key:
             args.headers["Authorization"] = f"Bearer {self.api_key}"

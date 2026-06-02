@@ -251,13 +251,23 @@ async def stream_response(
         # TPOT delay between tokens
         await asyncio.sleep(tpot_ms / 1000)
 
-    # Final chunk with usage
+    # Final chunk with finish_reason (no usage here due to evalscope's elif bug)
+    yield make_chunk(chunk_id, model, finish=True)
+
+    # Separate usage chunk (evalscope processes usage only when no choices)
     usage = {
         "prompt_tokens": input_tokens,
         "completion_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
     }
-    yield make_chunk(chunk_id, model, finish=True, usage=usage)
+    usage_chunk = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "usage": usage,
+    }
+    yield f"data: {json.dumps(usage_chunk)}\n\n"
     yield "data: [DONE]\n\n"
 
     _update_metrics_on_complete(output_tokens)

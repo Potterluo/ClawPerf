@@ -62,9 +62,24 @@ class TokenizerManager:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
     def count_chat_tokens(self, messages: list[dict]) -> int:
-        """Count tokens for chat-formatted messages using EvalScope's utility."""
-        from evalscope.perf.plugin.datasets.utils import tokenize_chat_messages
-        return len(tokenize_chat_messages(self.tokenizer, messages, add_generation_prompt=True))
+        """Count tokens for chat-formatted messages.
+
+        Uses EvalScope's utility if tokenizer has chat_template,
+        otherwise falls back to simple concatenation.
+        """
+        # Check if tokenizer has chat_template
+        if self.tokenizer.chat_template is not None:
+            from evalscope.perf.plugin.datasets.utils import tokenize_chat_messages
+            return len(tokenize_chat_messages(self.tokenizer, messages, add_generation_prompt=True))
+
+        # Fallback: simple role/content format
+        total_text = ""
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            total_text += f"<|{role}|>\n{content}\n"
+        total_text += "<|assistant|>\n"  # Add generation prompt
+        return self.count_tokens(total_text)
 
     def count_input_tokens_from_request(self, request_json_str: str) -> int:
         """Count input tokens from a serialized request JSON — same as OpenaiPlugin._count_input_tokens."""
