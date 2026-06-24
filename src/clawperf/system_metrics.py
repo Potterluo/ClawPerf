@@ -39,7 +39,15 @@ BACKEND_MAP = {"vllm": VLLM_METRICS, "sglang": SGLANG_METRICS, "mindie": MINDIE_
 
 
 def parse_prometheus_metrics(text: str) -> Dict[str, float]:
-    result = {}
+    """Parse Prometheus exposition text.
+
+    Stores the fully-qualified (labeled) key AND an aggregated base form that
+    SUMS across all labeled instances of the same metric. Summing is correct
+    for the cumulative counters used by ``compute_prefix_cache_delta`` and for
+    running/waiting gauges; it fixes an undercount when vLLM emits one series
+    per model/engine. (Ratio gauges are only displayed, never differenced.)
+    """
+    result: Dict[str, float] = {}
     for line in text.split("\n"):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -47,12 +55,16 @@ def parse_prometheus_metrics(text: str) -> Dict[str, float]:
         parts = line.rsplit(None, 1)
         if len(parts) == 2:
             try:
-                result[parts[0]] = float(parts[1])
-                base = parts[0].split("{")[0]
-                if base not in result:
-                    result[base] = float(parts[1])
+                value = float(parts[1])
             except ValueError:
                 continue
+            result[parts[0]] = value
+            base = parts[0].split("{")[0]
+            if base == parts[0]:
+                # No labels: the qualified key already holds the value.
+                continue
+            # Labeled instance: aggregate into the base form by summing.
+            result[base] = result.get(base, 0.0) + value
     return result
 
 

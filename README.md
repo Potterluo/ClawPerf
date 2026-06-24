@@ -136,6 +136,7 @@ clawperf \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--output` | results.json | Output JSON file path |
+| `--history` | clawperf_history.jsonl | Append a one-line record (config + summary + per-user aggregates) to this JSONL file on every run, accumulating results across runs. Pass an empty string to disable. |
 
 ## Output Format
 
@@ -181,6 +182,28 @@ Results are saved as JSON with:
   "timeline": [ ... ]
 }
 ```
+
+## Result History
+
+Every run appends one compact JSON line to `clawperf_history.jsonl` (configurable
+via `--history`, disable with `--history ""`). Each line carries the run
+`timestamp`, the full `config`, the `summary`, `timing`, and per-user
+`aggregate`s — but not the heavy per-turn arrays, so the file stays queryable
+as runs accumulate.
+
+Collect and compare results across runs with standard tooling:
+
+```bash
+# Latest run's hit rate
+tail -n1 clawperf_history.jsonl | jq '.summary.prefix_cache_token_hit_rate'
+
+# Throughput trend over all runs
+jq -c '{users: .config.num_users, bench_s: .timing.bench_time_s,
+        hit_rate: .summary.prefix_cache_token_hit_rate}' clawperf_history.jsonl
+```
+
+The full per-turn detail for any run is still in its `--output` JSON file,
+referenced from each history record's `output_file` field.
 
 ## Testing Philosophy
 

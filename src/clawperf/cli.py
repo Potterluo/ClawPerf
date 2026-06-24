@@ -63,6 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
     g = parser.add_argument_group("Output")
     g.add_argument("--output", type=str, default="",
                    help="Output JSON file path (default: timestamped results_<timestamp>.json)")
+    g.add_argument("--history", type=str, default="clawperf_history.jsonl",
+                   help="Append a one-line record (config + summary + per-user aggregates) "
+                        "to this JSONL file on every run, accumulating results across runs. "
+                        "Pass an empty string to disable.")
     g.add_argument("-v", "--verbose", action="store_true", default=False,
                    help="Print per-turn progress lines (default: tqdm progress bar)")
 
@@ -93,6 +97,7 @@ def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
         metrics_interval=args.metrics_interval,
         backend=args.backend,
         output=args.output,
+        history=args.history,
         verbose=args.verbose,
     )
 

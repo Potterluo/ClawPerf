@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
-from clawperf.system_metrics import parse_prometheus_metrics, BACKEND_MAP, SystemMetricsPoller
+from clawperf.system_metrics import BACKEND_MAP, SystemMetricsPoller, parse_prometheus_metrics
 
 
 def test_parse_prometheus_simple():
@@ -20,6 +18,29 @@ def test_parse_prometheus_with_labels():
     result = parse_prometheus_metrics(text)
     assert 'vllm:num_requests_running{model="qwen"}' in result
     assert "vllm:num_requests_running" in result
+
+
+def test_parse_prometheus_multi_instance_sums():
+    """Multiple labeled instances (e.g. per model/engine) must be SUMMED in the
+    base form — otherwise prefix-cache deltas are undercounted (regression)."""
+    text = (
+        'vllm:prefix_cache_hit_tokens_total{model="A"} 100\n'
+        'vllm:prefix_cache_hit_tokens_total{model="B"} 50\n'
+        'vllm:prefix_cache_query_tokens_total{model="A"} 1000\n'
+        'vllm:prefix_cache_query_tokens_total{model="B"} 500\n'
+    )
+    result = parse_prometheus_metrics(text)
+    assert result["vllm:prefix_cache_hit_tokens_total"] == 150.0
+    assert result["vllm:prefix_cache_query_tokens_total"] == 1500.0
+    # Fully-qualified instances still preserved individually.
+    assert result['vllm:prefix_cache_hit_tokens_total{model="A"}'] == 100.0
+
+
+def test_parse_prometheus_no_label_not_doubled():
+    """A label-free metric must not be double-counted into its base form."""
+    text = "vllm:gpu_cache_usage_perc 0.45\n"
+    result = parse_prometheus_metrics(text)
+    assert result["vllm:gpu_cache_usage_perc"] == 0.45
 
 
 def test_parse_prometheus_comments_and_empty():

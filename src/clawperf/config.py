@@ -45,6 +45,7 @@ class BenchmarkConfig:
 
     # ── Output configuration ──
     output: str = ""  # defaults to timestamped filename if empty
+    history: str = "clawperf_history.jsonl"  # JSONL append log; "" disables
     verbose: bool = False  # per-turn detailed logging
 
     # ── Derived fields ──

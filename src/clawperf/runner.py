@@ -547,8 +547,47 @@ class BenchmarkRunner:
         with open(self.config.output, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False, default=str)
 
+        # Append a compact one-line record (config + summary + per-user aggregates)
+        # to the history JSONL so results accumulate across runs.
+        self._append_history(result, setup_time_s, bench_time_s)
+
         self._print_final_summary(bench_time_s, setup_time_s)
         logger.info("Results saved to: %s", self.config.output)
+
+    def _append_history(self, result: dict, setup_time_s: float, bench_time_s: float):
+        """Append a queryable record to the JSONL history file (one line per run).
+
+        Keeps the line compact: full config + summary + per-user aggregates, but
+        NOT the full per-turn / timeline / metrics-sample arrays (those live in
+        the ``--output`` file referenced by ``output_file``).
+        """
+        if not self.config.history:
+            return
+        import os
+        from datetime import datetime
+
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "output_file": os.path.abspath(self.config.output),
+            "config": result["config"],
+            "summary": result["summary"],
+            "timing": {"setup_time_s": setup_time_s, "bench_time_s": bench_time_s},
+            # Per-user aggregates only (drop the heavy per-turn detail).
+            "users": [
+                {"user_id": u["user_id"], "aggregate": u["aggregate"]}
+                for u in result.get("users", [])
+            ],
+        }
+        try:
+            out_dir = os.path.dirname(self.config.history)
+            if out_dir and not os.path.exists(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+            # Append mode — each run adds exactly one line.
+            with open(self.config.history, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            logger.info("History appended to: %s", self.config.history)
+        except OSError as e:
+            logger.warning("Failed to append history to %s: %s", self.config.history, e)
 
     # ── Pretty output ──
 
@@ -742,6 +781,8 @@ class BenchmarkRunner:
             print("  Metrics:      NOT configured — prefix cache data will not be collected", flush=True)
         else:
             print(f"  Metrics:      {self.config.metrics_endpoint}", flush=True)
+        if self.config.history:
+            print(f"  History:      {self.config.history} (append)", flush=True)
         print("=" * 70, flush=True)
 
     async def _add_timeline(self, event: str, user_id: int, time_offset: float, **kwargs):
