@@ -173,15 +173,25 @@ Results are saved as JSON with:
           "input_tokens": 25000,
           "output_tokens": 1000,
           "context_tokens": 25000,
-          "compaction_triggered": false
+          "compaction_triggered": false,
+          "wall_start_ts": 0.016,
+          "wall_end_ts": 3.354
         }
       ]
     }
   ],
   "system_metrics": [ ... ],
-  "timeline": [ ... ]
+  "timeline": [ ... ],
+  "timing": {
+    "setup_time_s": 7.437,
+    "bench_time_s": 12.281
+  }
 }
 ```
+
+`timing.bench_time_s` excludes one-time setup (tokenizer download + content
+generation); per-turn `wall_start_ts`/`wall_end_ts` are offsets from the
+benchmark start and back the per-user duration/throughput aggregates.
 
 ## Result History
 
@@ -280,11 +290,12 @@ Key modules:
 |--------|------|
 | `cli.py` | Argparse entry point, config creation, runner launch |
 | `config.py` | `BenchmarkConfig` dataclass, arrival mode parsing |
-| `runner.py` | `BenchmarkRunner` orchestrator, user loop, result finalization |
+| `runner.py` | `BenchmarkRunner` orchestrator, user loop, result finalization, JSONL history |
 | `context.py` | `UserContext` context assembly, compaction with infinite-loop guard |
 | `scheduler.py` | Burst/steady/Poisson async generators |
 | `system_metrics.py` | `SystemMetricsPoller` with backend-specific metric mappings |
 | `tokenizer.py` | `TokenizerManager` wrapping ModelScope/HuggingFace tokenizers |
+| `logging_setup.py` | Centralized logging routed through `tqdm.write` |
 | `mock_server.py` | FastAPI mock LLM server with trie-based prefix cache simulation |
 
 ## Development

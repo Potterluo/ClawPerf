@@ -165,6 +165,7 @@ clawperf \
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--output` | results.json | 结果输出文件路径 |
+| `--history` | clawperf_history.jsonl | 每次运行追加一行记录（config + summary + 每用户聚合）到该 JSONL 文件，跨运行累积结果。传空字符串禁用。 |
 
 ## 输出格式
 
@@ -201,15 +202,45 @@ clawperf \
           "input_tokens": 25000,
           "output_tokens": 1000,
           "context_tokens": 25000,
-          "compaction_triggered": false
+          "compaction_triggered": false,
+          "wall_start_ts": 0.016,
+          "wall_end_ts": 3.354
         }
       ]
     }
   ],
   "system_metrics": [ ... ],
-  "timeline": [ ... ]
+  "timeline": [ ... ],
+  "timing": {
+    "setup_time_s": 7.437,
+    "bench_time_s": 12.281
+  }
 }
 ```
+
+`timing.bench_time_s` 不含一次性 setup（tokenizer 下载 + 内容生成）；每轮的
+`wall_start_ts`/`wall_end_ts` 是相对 benchmark 起点的偏移，用于计算每用户
+duration/throughput 聚合。
+
+## 结果历史
+
+每次运行都会向 `clawperf_history.jsonl`（可用 `--history` 配置，传 `--history ""` 禁用）
+追加一行紧凑记录：`timestamp` + 完整 `config` + `summary` + `timing` + 每用户
+`aggregate`（不含庞大的逐轮数组，保证文件随运行累积仍可查询）。
+
+跨运行汇总对比结果：
+
+```bash
+# 最近一次的命中率
+tail -n1 clawperf_history.jsonl | jq '.summary.prefix_cache_token_hit_rate'
+
+# 所有运行的吞吐趋势
+jq -c '{users: .config.num_users, bench_s: .timing.bench_time_s,
+        hit_rate: .summary.prefix_cache_token_hit_rate}' clawperf_history.jsonl
+```
+
+任意一次运行的完整逐轮明细仍在其 `--output` JSON 文件中，可从历史记录的
+`output_file` 字段定位。
 
 ## 上下文模型
 
@@ -259,11 +290,12 @@ ClawPerf 复用 EvalScope 的核心 perf 组件：
 |------|------|
 | `cli.py` | Argparse 入口，配置创建，启动 runner |
 | `config.py` | `BenchmarkConfig` 数据类，到达模式解析 |
-| `runner.py` | `BenchmarkRunner` 编排器，用户循环，结果汇总 |
+| `runner.py` | `BenchmarkRunner` 编排器，用户循环，结果汇总，JSONL 历史 |
 | `context.py` | `UserContext` 上下文组装，带无限循环保护的压缩 |
 | `scheduler.py` | Burst/steady/Poisson 异步生成器 |
 | `system_metrics.py` | `SystemMetricsPoller` 后端特定的指标映射 |
 | `tokenizer.py` | `TokenizerManager` 封装 ModelScope/HuggingFace tokenizer |
+| `logging_setup.py` | 集中式日志，经 `tqdm.write` 输出 |
 | `mock_server.py` | FastAPI Mock LLM 服务器，Trie prefix cache 模拟 |
 
 ## 开发
