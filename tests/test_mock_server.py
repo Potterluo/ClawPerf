@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from clawperf.mock_server import (
-    _estimate_tokens, _generate_content, SUPPORTED_MODELS,
-    PrefixCacheTrie, _messages_to_chunks,
+    SUPPORTED_MODELS,
+    PrefixCacheTrie,
+    _estimate_tokens,
+    _generate_content,
+    _messages_to_chunks,
 )
 
 
@@ -53,5 +56,79 @@ def test_trie_grows_on_repeated_insert():
              {"role": "assistant", "content": "reply2"}, {"role": "user", "content": "final"}]
     chunks3 = _messages_to_chunks(msgs3)
     matched = trie.query(chunks3)
-    expected = _estimate_tokens("sys") + _estimate_tokens("hello") + _estimate_tokens("reply1") + _estimate_tokens("more")
+    expected = sum(_estimate_tokens(c) for c in ("sys", "hello", "reply1", "more"))
     assert matched == expected
+
+
+def test_trie_eviction_removes_oldest():
+    """Eviction must actually drop the oldest sequence (regression: it was a no-op)."""
+    trie = PrefixCacheTrie(max_prefixes=4)
+    for i in range(10):
+        trie.insert(_messages_to_chunks([
+            {"role": "system", "content": f"sys{i}"},
+            {"role": "user", "content": f"u{i}"},
+        ]))
+    # Cache capped at 4 sequences; the 6 oldest must be gone.
+    assert len(trie._sequences) <= 4
+    oldest = _messages_to_chunks([
+        {"role": "system", "content": "sys0"},
+        {"role": "user", "content": "u0"},
+    ])
+    assert trie.query(oldest) == 0  # fully evicted
+    newest = _messages_to_chunks([
+        {"role": "system", "content": "sys9"},
+        {"role": "user", "content": "u9"},
+    ])
+    assert trie.query(newest) > 0   # still cached
+
+
+def test_trie_eviction_preserves_shared_prefix():
+    """When a sequence is evicted, shared prefix nodes that another live sequence
+    references must survive (regression: old code deleted by hash, corrupting it)."""
+    trie = PrefixCacheTrie(max_prefixes=2)
+    shared = [{"role": "system", "content": "shared"}]
+    a = shared + [{"role": "user", "content": "u1"}]
+    b = shared + [{"role": "user", "content": "u1"},
+                  {"role": "assistant", "content": "a1"},
+                  {"role": "user", "content": "q2"}]
+    trie.insert(_messages_to_chunks(a))
+    trie.insert(_messages_to_chunks(b))
+    # Insert a third distinct sequence -> evicts `a`, but `shared` is still used by `b`.
+    trie.insert(_messages_to_chunks([
+        {"role": "system", "content": "other"},
+        {"role": "user", "content": "x"},
+    ]))
+    matched = trie.query(_messages_to_chunks(b))
+    assert matched > 0  # shared prefix survived eviction
+
+
+def test_trie_reinsert_refreshes_recency():
+    """Re-inserting the same sequence counts as a recent use (not evicted first)."""
+    def msgs(s, u):
+        return [{"role": "system", "content": s}, {"role": "user", "content": u}]
+
+    trie = PrefixCacheTrie(max_prefixes=2)
+    a = _messages_to_chunks(msgs("s0", "u0"))
+    trie.insert(a)
+    trie.insert(_messages_to_chunks(msgs("s1", "u1")))
+    # Touch `a` again so it becomes the most-recent.
+    trie.insert(a)
+    trie.insert(_messages_to_chunks(msgs("s2", "u2")))
+    # `a` was refreshed, so s1 should have been evicted instead.
+    assert trie.query(a) > 0
+
+
+def test_trie_hit_rate_grows_with_prefix_reuse():
+    """Multi-turn workload: hit tokens should grow turn over turn (monotonic-ish)."""
+    trie = PrefixCacheTrie()
+    history = []
+    hits = []
+    for i in range(5):
+        history.append({"role": "user", "content": f"q{i}"})
+        history.append({"role": "assistant", "content": f"a{i}"})
+        chunks = _messages_to_chunks([{"role": "system", "content": "sys"}] + history)
+        hits.append(trie.query(chunks))
+        trie.insert(chunks)
+    # Turn 1 has no prior cache (only system prefix shared, but it wasn't inserted yet)
+    # Subsequent turns should reuse more.
+    assert hits[-1] > hits[1] > hits[0]

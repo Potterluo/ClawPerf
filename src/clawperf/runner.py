@@ -23,17 +23,6 @@ from clawperf.tokenizer import TokenizerManager
 logger = logging.getLogger("clawperf")
 
 
-class _TqdmLogHandler(logging.Handler):
-    """Redirects log output through tqdm.write() so messages don't break the progress bar."""
-
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            tqdm.write(msg)
-        except Exception:
-            self.handleError(record)
-
-
 def classify_error(bd) -> str:
     """Classify a BenchmarkData error into a standard error type."""
     if bd is None:
@@ -51,6 +40,26 @@ def classify_error(bd) -> str:
     return ""
 
 
+def _percentile(values: list[float], q: float) -> float:
+    """Linear-interpolation percentile (matches numpy's default 'linear' method).
+
+    Robust for any sample size: returns the single value when N==1, interpolates
+    between adjacent samples otherwise, and never indexes out of range.
+    """
+    if not values:
+        return 0.0
+    s = sorted(values)
+    n = len(s)
+    if n == 1:
+        return s[0]
+    # Position in [0, n-1] with linear interpolation between neighbors.
+    pos = q * (n - 1)
+    lo = int(pos)
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return s[lo] * (1 - frac) + s[hi] * frac
+
+
 def _percentiles(values: list[float]) -> dict:
     """Compute avg, P50, P75, P99, min, max from a list of values."""
     if not values:
@@ -60,10 +69,10 @@ def _percentiles(values: list[float]) -> dict:
     return {
         "avg": statistics.mean(s),
         "min": s[0],
-        "P50": s[int(n * 0.50)],
-        "P75": s[int(n * 0.75)],
-        "P90": s[int(n * 0.90)],
-        "P99": s[min(int(n * 0.99), n - 1)],
+        "P50": _percentile(values, 0.50),
+        "P75": _percentile(values, 0.75),
+        "P90": _percentile(values, 0.90),
+        "P99": _percentile(values, 0.99),
         "max": s[-1],
         "N": n,
     }
@@ -98,20 +107,23 @@ class BenchmarkRunner:
         self._timeline_events: List[Dict] = []
 
         self._shutdown = False
-        self._start_time: float = 0.0
+        # Two-phase timing: setup (tokenizer + content generation) is separated
+        # from the actual benchmark window so reported Duration reflects only
+        # request execution, not one-time startup cost.
+        self._setup_start_time: float = 0.0
+        self._bench_start_time: float = 0.0
         self._user_tasks: List[asyncio.Task] = []
         self._completed_turns: int = 0
         self._total_turns: int = 0
         self._pbar = None
-        self._tqdm_handler: Optional[_TqdmLogHandler] = None
-        self._saved_handlers: Optional[List[logging.Handler]] = None
+        self._signal_installed = False
         self._metrics_start: Optional[Dict] = None
         self._metrics_end: Optional[Dict] = None
         self._prefix_cache_delta: Optional[Dict] = None
 
     async def run(self):
         """Execute the full benchmark."""
-        self._start_time = time.monotonic()
+        self._setup_start_time = time.monotonic()
         self._setup_signal_handler()
         self._print_banner()
 
@@ -135,27 +147,9 @@ class BenchmarkRunner:
             rate=-1,
         )
 
-        # 3. Generate content
-        logger.info("Generating system prefix (%d tokens)...", self.config.system_prefix_tokens)
-        if self.config.system_prefix_source == "random":
-            self._system_prefix_content = self.tokenizer_manager.generate_random_content(
-                self.config.system_prefix_tokens
-            )
-        else:
-            self._system_prefix_content = self.tokenizer_manager.generate_content_from_file(
-                self.config.system_prefix_source, self.config.system_prefix_tokens
-            )
-
-        logger.info("Generating user prefix content (%d tokens/user)...", self.config.user_prefix_tokens)
-        for uid in range(self.config.num_users):
-            self._user_prefix_contents[uid] = self.tokenizer_manager.generate_random_content(
-                self.config.user_prefix_tokens
-            )
-
-        logger.info("Generating per-turn input (%d tokens)...", self.config.input_tokens_per_turn)
-        self._turn_input_content = self.tokenizer_manager.generate_random_content(
-            self.config.input_tokens_per_turn
-        )
+        # 3. Generate content (off the event loop so it stays responsive;
+        #    logging is now configured so each phase prints a live status line).
+        await self._generate_content()
 
         # 4. Initialize user contexts
         self._total_turns = self.config.num_users * self.config.max_turns
@@ -182,21 +176,19 @@ class BenchmarkRunner:
             self._metrics_start = await self.system_poller.snapshot()
             logger.info("Metrics start snapshot: %s", self._metrics_start)
 
+        setup_time = time.monotonic() - self._setup_start_time
+        logger.info("Setup complete in %.2fs — starting benchmark", setup_time)
+
+        # Benchmark window starts here (excludes setup).
+        self._bench_start_time = time.monotonic()
+
         # 6. Schedule users
         logger.info("Starting benchmark: %d users, arrival=%s", self.config.num_users, self.config.user_arrival)
         scheduler = get_scheduler(self.config)
 
-        # Start tqdm progress bar (non-verbose mode)
+        # Start tqdm progress bar (non-verbose mode). Logging already routes
+        # through tqdm.write() via logging_setup, so no handler swapping needed.
         if not self.config.verbose:
-            # Redirect clawperf logging through tqdm.write() so log messages
-            # don't break the progress bar's single-line display.
-            self._tqdm_handler = _TqdmLogHandler()
-            existing = logger.handlers
-            fmt = existing[0].formatter if existing else logging.Formatter(logging.BASIC_FORMAT)
-            self._tqdm_handler.setFormatter(fmt)
-            self._saved_handlers = existing[:]
-            logger.handlers = [self._tqdm_handler]
-
             self._pbar = tqdm(
                 total=self._total_turns,
                 desc="Benchmark",
@@ -208,19 +200,19 @@ class BenchmarkRunner:
             if self._shutdown:
                 break
             if delay > 0:
-                await asyncio.sleep(delay)
+                await self._interruptible_sleep(delay)
             if self._shutdown:
                 break
 
-            await self._add_timeline("user_joined", uid, time.monotonic() - self._start_time)
+            await self._add_timeline("user_joined", uid, time.monotonic() - self._bench_start_time)
             task = asyncio.create_task(self._run_user_loop(uid), name=f"user-{uid}")
             self._user_tasks.append(task)
 
-        # 7. Wait for completion
-        if self._user_tasks and not self._shutdown:
+        # 7. Wait for completion (always await so no task is orphaned on shutdown)
+        if self._user_tasks:
             results = await asyncio.gather(*self._user_tasks, return_exceptions=True)
             for i, result in enumerate(results):
-                if isinstance(result, Exception):
+                if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
                     logger.error("User task %d failed: %s", i, result)
 
         # Snapshot metrics after all benchmark requests
@@ -228,16 +220,55 @@ class BenchmarkRunner:
             self._metrics_end = await self.system_poller.snapshot()
             logger.info("Metrics end snapshot: %s", self._metrics_end)
 
-        # 8. Close progress bar and restore logging
+        # 8. Close progress bar
         if self._pbar:
             self._pbar.close()
-        if self._tqdm_handler and self._saved_handlers is not None:
-            logger.handlers = self._saved_handlers
-            self._tqdm_handler = None
-            self._saved_handlers = None
 
         # 9. Cleanup & save
         await self._finalize()
+
+    async def _generate_content(self):
+        """Generate system/user-prefix/turn-input content off the event loop."""
+        logger.info("Generating system prefix (%d tokens)...", self.config.system_prefix_tokens)
+        if self.config.system_prefix_source == "random":
+            self._system_prefix_content = await self._gen_off_thread(
+                self.tokenizer_manager.generate_random_content,
+                self.config.system_prefix_tokens,
+            )
+        else:
+            self._system_prefix_content = await self._gen_off_thread(
+                self.tokenizer_manager.generate_content_from_file,
+                self.config.system_prefix_source,
+                self.config.system_prefix_tokens,
+            )
+
+        logger.info("Generating user prefix content (%d tokens/user)...", self.config.user_prefix_tokens)
+        for uid in range(self.config.num_users):
+            self._user_prefix_contents[uid] = await self._gen_off_thread(
+                self.tokenizer_manager.generate_random_content,
+                self.config.user_prefix_tokens,
+            )
+            # Yield between users so the loop stays responsive during long generation.
+            await asyncio.sleep(0)
+
+        logger.info("Generating per-turn input (%d tokens)...", self.config.input_tokens_per_turn)
+        self._turn_input_content = await self._gen_off_thread(
+            self.tokenizer_manager.generate_random_content,
+            self.config.input_tokens_per_turn,
+        )
+
+    @staticmethod
+    async def _gen_off_thread(func, *args):
+        """Run a blocking tokenizer call in a worker thread."""
+        return await asyncio.to_thread(func, *args)
+
+    @staticmethod
+    async def _interruptible_sleep(delay: float):
+        """``asyncio.sleep`` that wakes promptly when the running task is cancelled."""
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            pass
 
     async def _run_user_loop(self, user_id: int):
         ctx = self._user_contexts[user_id]
@@ -254,7 +285,7 @@ class BenchmarkRunner:
 
             if turn_result["compaction_event"]:
                 evt = turn_result["compaction_event"]
-                evt.time = time.monotonic() - self._start_time
+                evt.time = time.monotonic() - self._bench_start_time
                 await self._add_timeline(
                     "compaction", user_id, evt.time,
                     turn=turn_id,
@@ -284,7 +315,9 @@ class BenchmarkRunner:
                 logger.warning("[User %02d] Turn %d: failed to build request", user_id, turn_id)
                 continue
 
+            wall_start = time.monotonic()
             benchmark_data = await self._http_client.post(request_body)
+            wall_end = time.monotonic()
 
             try:
                 if benchmark_data.success:
@@ -295,6 +328,7 @@ class BenchmarkRunner:
                 turn_record = self._build_turn_record(
                     user_id, turn_id, benchmark_data, context_tokens,
                     turn_result["compaction_triggered"],
+                    wall_start, wall_end,
                 )
                 self._turn_records.append(turn_record)
 
@@ -315,6 +349,8 @@ class BenchmarkRunner:
                     "error_type": "processing_error",
                     "error": str(e),
                     "context_tokens": context_tokens,
+                    "wall_start_ts": wall_start - self._bench_start_time,
+                    "wall_end_ts": wall_end - self._bench_start_time,
                 }
                 self._turn_records.append(error_record)
                 self._advance_progress(error_record)
@@ -356,14 +392,20 @@ class BenchmarkRunner:
             )
 
     def _build_turn_record(
-        self, user_id: int, turn_id: int, bd, context_tokens: int, compaction: bool
+        self, user_id: int, turn_id: int, bd, context_tokens: int, compaction: bool,
+        wall_start: float = 0.0, wall_end: float = 0.0,
     ) -> dict:
+        # Wall-clock offsets (relative to benchmark start) for correct per-user
+        # duration / throughput — not derivable from per-request latencies alone.
+        bench_start = self._bench_start_time or wall_start
         record = {
             "user_id": user_id,
             "turn_id": turn_id,
             "success": bd.success,
             "context_tokens": context_tokens,
             "compaction_triggered": compaction,
+            "wall_start_ts": round(wall_start - bench_start, 3) if wall_start else None,
+            "wall_end_ts": round(wall_end - bench_start, 3) if wall_end else None,
         }
 
         # Save request details
@@ -426,15 +468,15 @@ class BenchmarkRunner:
         if itl_p50_values:
             agg["itl_p50"] = _percentiles(itl_p50_values)
 
-        if success_turns and agg["total_output_tokens"] > 0:
-            first_e2e = success_turns[0].get("e2e_latency_ms", 0) or 0
-            first_ttft = success_turns[0].get("ttft_ms", 0) or 0
-            last_e2e = success_turns[-1].get("e2e_latency_ms", 0) or 0
-            user_duration_s = (last_e2e / 1000) if last_e2e > 0 else 0
-            agg["duration_s"] = user_duration_s
-            active_time_s = (last_e2e - first_ttft) / 1000 if last_e2e > first_ttft else last_e2e / 1000
-            if active_time_s > 0:
-                agg["throughput_tok_s"] = agg["total_output_tokens"] / active_time_s
+        # Real per-user wall-clock duration: from the first turn's start to the
+        # last turn's end (timestamps are offsets relative to benchmark start).
+        starts = [t["wall_start_ts"] for t in success_turns if t.get("wall_start_ts") is not None]
+        ends = [t["wall_end_ts"] for t in success_turns if t.get("wall_end_ts") is not None]
+        if starts and ends:
+            user_duration_s = max(ends) - min(starts)
+            if user_duration_s > 0:
+                agg["duration_s"] = user_duration_s
+                agg["throughput_tok_s"] = agg["total_output_tokens"] / user_duration_s
 
         return agg
 
@@ -445,7 +487,10 @@ class BenchmarkRunner:
         if self._http_client:
             await self._http_client.client.close()
 
-        wall_time_s = (time.monotonic() - self._start_time) if self._start_time > 0 else 0
+        # Split wall time: setup (tokenizer + content generation) vs the actual
+        # benchmark request window. Reported Duration reflects only the latter.
+        setup_time_s = (self._bench_start_time - self._setup_start_time) if self._setup_start_time else 0.0
+        bench_time_s = (time.monotonic() - self._bench_start_time) if self._bench_start_time else 0.0
 
         if self._accumulator:
             es_metrics = self._accumulator.to_result()
@@ -488,6 +533,10 @@ class BenchmarkRunner:
             "users": users_data,
             "system_metrics": sys_metrics,
             "timeline": self._timeline_events,
+            "timing": {
+                "setup_time_s": round(setup_time_s, 3),
+                "bench_time_s": round(bench_time_s, 3),
+            },
         }
 
         import os
@@ -498,12 +547,12 @@ class BenchmarkRunner:
         with open(self.config.output, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False, default=str)
 
-        self._print_final_summary(wall_time_s)
+        self._print_final_summary(bench_time_s, setup_time_s)
         logger.info("Results saved to: %s", self.config.output)
 
     # ── Pretty output ──
 
-    def _print_final_summary(self, wall_time_s: float):
+    def _print_final_summary(self, bench_time_s: float, setup_time_s: float = 0.0):
         success_turns = [t for t in self._turn_records if t.get("success")]
         error_turns = [t for t in self._turn_records if not t.get("success")]
         total_reqs = len(self._turn_records)
@@ -517,32 +566,35 @@ class BenchmarkRunner:
         ct.field_names = ["Metric", "Value"]
         ct.align["Metric"] = "l"
         ct.align["Value"] = "r"
-        ct.add_row(["Duration", f"{wall_time_s:.2f} s"])
+        ct.add_row(["Setup Time", f"{setup_time_s:.2f} s"])
+        ct.add_row(["Duration", f"{bench_time_s:.2f} s"])
         ct.add_row(["Total Requests", str(total_reqs)])
         ct.add_row(["Success Requests", str(len(success_turns))])
         ct.add_row(["Failed Requests", str(len(error_turns))])
         ct.add_row(["Total Input Tokens", f"{total_in_tok:,}"])
-        ct.add_row(["Prefill Token Throughput", f"{total_in_tok / wall_time_s:.2f} tok/s" if wall_time_s > 0 else "N/A"])
+        ct.add_row(["Prefill Token Throughput", f"{total_in_tok / bench_time_s:.2f} tok/s" if bench_time_s > 0 else "N/A"])
         ct.add_row(["Total Output Tokens", f"{total_out_tok:,}"])
-        ct.add_row(["Request Throughput", f"{len(success_turns) / wall_time_s:.4f} req/s" if wall_time_s > 0 else "N/A"])
-        ct.add_row(["Output Token Throughput", f"{total_out_tok / wall_time_s:.2f} tok/s" if wall_time_s > 0 else "N/A"])
-        ct.add_row(["Total Token Throughput", f"{(total_in_tok + total_out_tok) / wall_time_s:.2f} tok/s" if wall_time_s > 0 else "N/A"])
+        ct.add_row(["Request Throughput", f"{len(success_turns) / bench_time_s:.4f} req/s" if bench_time_s > 0 else "N/A"])
+        ct.add_row(["Output Token Throughput", f"{total_out_tok / bench_time_s:.2f} tok/s" if bench_time_s > 0 else "N/A"])
+        ct.add_row(["Total Token Throughput", f"{(total_in_tok + total_out_tok) / bench_time_s:.2f} tok/s" if bench_time_s > 0 else "N/A"])
         ct.add_row(["Total Compactions", str(total_comp)])
         if self._prefix_cache_delta:
             tok_rate = self._prefix_cache_delta.get("prefix_cache_token_hit_rate")
             if tok_rate is not None:
                 ct.add_row(["HBM Prefix Cache Token Hit Rate", f"{tok_rate * 100:.2f}%"])
-            hit_tok = self._prefix_cache_delta.get("prefix_cache_hit_tokens_delta", 0)
-            q_tok = self._prefix_cache_delta.get("prefix_cache_query_tokens_delta", 0)
+            # Counter deltas arrive as floats from Prometheus parsing — display as ints.
+            hit_tok = int(self._prefix_cache_delta.get("prefix_cache_hit_tokens_delta", 0))
+            q_tok = int(self._prefix_cache_delta.get("prefix_cache_query_tokens_delta", 0))
             ct.add_row(["HBM Prefix Cache Hit Tokens", f"{hit_tok:,}"])
             ct.add_row(["HBM Prefix Cache Query Tokens", f"{q_tok:,}"])
-            if self._prefix_cache_delta["prefix_cache_evictions_delta"] > 0:
-                ct.add_row(["HBM Prefix Cache Evictions", str(self._prefix_cache_delta["prefix_cache_evictions_delta"])])
+            evictions = int(self._prefix_cache_delta.get("prefix_cache_evictions_delta", 0))
+            if evictions > 0:
+                ct.add_row(["HBM Prefix Cache Evictions", str(evictions)])
             ext_tok_rate = self._prefix_cache_delta.get("external_prefix_cache_token_hit_rate")
             if ext_tok_rate is not None:
                 ct.add_row(["External Prefix Cache Token Hit Rate", f"{ext_tok_rate * 100:.2f}%"])
-            ext_hit_tok = self._prefix_cache_delta.get("external_prefix_cache_hit_tokens_delta", 0)
-            ext_q_tok = self._prefix_cache_delta.get("external_prefix_cache_query_tokens_delta", 0)
+            ext_hit_tok = int(self._prefix_cache_delta.get("external_prefix_cache_hit_tokens_delta", 0))
+            ext_q_tok = int(self._prefix_cache_delta.get("external_prefix_cache_query_tokens_delta", 0))
             ct.add_row(["External Prefix Cache Hit Tokens", f"{ext_hit_tok:,}"])
             ct.add_row(["External Prefix Cache Query Tokens", f"{ext_q_tok:,}"])
         if error_turns:
@@ -698,8 +750,20 @@ class BenchmarkRunner:
         self._timeline_events.append(entry)
 
     def _setup_signal_handler(self):
-        """Register SIGINT handler. Falls back to signal.signal on Windows."""
-        def on_sigint():
+        """Register SIGINT handler for graceful shutdown.
+
+        On Unix we use the loop's signal handler (runs in the event loop thread,
+        can safely cancel tasks). On Windows that API is unavailable, so we fall
+        back to ``signal.signal`` — the callback still flips ``_shutdown`` and the
+        main loop exits at the next ``await`` checkpoint.
+        """
+        if self._signal_installed:
+            return
+
+        def on_sigint(*_):
+            if self._shutdown:
+                logger.info("SIGINT received again — forcing exit.")
+                raise KeyboardInterrupt
             logger.info("SIGINT received. Initiating graceful shutdown...")
             self._shutdown = True
             for task in self._user_tasks:
@@ -707,28 +771,31 @@ class BenchmarkRunner:
                     task.cancel()
             if self._pbar:
                 self._pbar.close()
-            if self._tqdm_handler and self._saved_handlers is not None:
-                logger.handlers = self._saved_handlers
 
         if platform.system() == "Windows":
-            signal.signal(signal.SIGINT, lambda *_: on_sigint())
+            signal.signal(signal.SIGINT, on_sigint)
         else:
             try:
                 asyncio.get_running_loop().add_signal_handler(signal.SIGINT, on_sigint)
             except NotImplementedError:
-                signal.signal(signal.SIGINT, lambda *_: on_sigint())
+                signal.signal(signal.SIGINT, on_sigint)
+        self._signal_installed = True
 
     async def shutdown_and_save(self):
+        """Graceful shutdown path — cancel outstanding tasks and finalize partial results.
+
+        All user tasks are awaited (with ``return_exceptions=True``) so none are
+        orphaned, avoiding 'Task was destroyed but it is pending' warnings.
+        """
         self._shutdown = True
         for task in self._user_tasks:
             if not task.done():
                 task.cancel()
         if self._pbar:
             self._pbar.close()
-        if self._tqdm_handler and self._saved_handlers is not None:
-            logger.handlers = self._saved_handlers
-            self._tqdm_handler = None
-            self._saved_handlers = None
+        # Ensure the benchmark window is closed even if interrupted mid-setup.
+        if not self._bench_start_time:
+            self._bench_start_time = time.monotonic()
         if self._user_tasks:
             await asyncio.gather(*self._user_tasks, return_exceptions=True)
         await self._finalize()

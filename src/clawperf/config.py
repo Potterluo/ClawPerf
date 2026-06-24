@@ -108,4 +108,9 @@ class BenchmarkConfig:
         return args
 
     def to_dict(self) -> dict:
-        return dataclasses.asdict(self)
+        """Serialize the *public* config (excludes derived internal fields)."""
+        d = dataclasses.asdict(self)
+        # Internal derived state — not part of the user-facing config.
+        d.pop("arrival_mode", None)
+        d.pop("arrival_param", None)
+        return d

@@ -17,6 +17,7 @@ import json
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from typing import AsyncGenerator
 
 import uvicorn
@@ -59,68 +60,77 @@ class PrefixCacheTrie:
     Each message content is hashed into a "chunk". Walking the trie with a
     request's message sequence finds the longest cached prefix — matching how
     vLLM's KV-block prefix cache works at the semantic level.
+
+    Eviction is LRU over *complete request paths*: every inserted sequence is
+    tracked with a reference count per node, so shared prefixes survive until no
+    live sequence references them. This keeps the hit-rate simulation correct
+    even as the cache turns over.
     """
 
     def __init__(self, max_prefixes: int = 200):
         self._root: dict = {}
-        self._token_counts: dict[str, int] = {}
+        self._token_counts: dict = {}  # chunk_hash -> estimated tokens
         self._max_prefixes = max_prefixes
-        self._num_prefixes = 0
-        self._insert_order: list[str] = []  # track insertion order for eviction
+        # Inserted sequences keyed by their chunk-hash tuple, in insertion order
+        # (the head is the least-recently-inserted / eviction candidate).
+        self._sequences: "OrderedDict[tuple, list]" = OrderedDict()
 
     def query(self, chunks: list[tuple[str, int]]) -> int:
         """Walk the trie and return the number of matched tokens."""
         node = self._root
         matched_tokens = 0
         for chunk_hash, tok_count in chunks:
-            if chunk_hash in node:
-                node = node[chunk_hash]
-                matched_tokens += tok_count
-            else:
+            child = node.get(chunk_hash)
+            if child is None:
                 break
+            node = child
+            matched_tokens += tok_count
         return matched_tokens
 
-    def _evict_oldest(self):
-        """Remove the oldest leaf path from the trie to stay within max_prefixes."""
-        while self._num_prefixes > self._max_prefixes and self._insert_order:
-            oldest = self._insert_order.pop(0)
-            # Walk the trie and remove this hash from its parent node
-            # Only remove if it's a leaf (empty children dict) or shallow branch
-            self._remove_hash(oldest)
-            self._token_counts.pop(oldest, None)
-            self._num_prefixes -= 1
-
-    def _remove_hash(self, chunk_hash: str):
-        """Remove a chunk_hash from the trie by walking all paths and pruning."""
-        stack = [(self._root, None, None)]  # (node, parent, key_in_parent)
-        to_remove = []
-        while stack:
-            node, parent, key = stack.pop()
-            for k, child in node.items():
-                if k == chunk_hash:
-                    to_remove.append((node, k))
-                stack.append((child, node, k))
-        for node, k in to_remove:
-            child = node[k]
-            # Only remove if child has no sub-children (leaf or shallow)
-            if not child:
-                del node[k]
-
     def insert(self, chunks: list[tuple[str, int]]) -> bool:
-        """Insert a full prompt sequence into the trie. Returns True if eviction happened."""
-        evicted = False
+        """Insert a full prompt sequence. Returns True if eviction occurred."""
+        seq_key = tuple(h for h, _ in chunks)
+
+        # Build / extend the path, bumping the per-node reference count so shared
+        # prefixes stay alive while any sequence still references them.
         node = self._root
         for chunk_hash, tok_count in chunks:
-            if chunk_hash not in node:
-                node[chunk_hash] = {}
-                self._num_prefixes += 1
-                self._token_counts[chunk_hash] = tok_count
-                self._insert_order.append(chunk_hash)
-            node = node[chunk_hash]
-        if self._num_prefixes > self._max_prefixes:
+            self._token_counts[chunk_hash] = tok_count
+            child = node.get(chunk_hash)
+            if child is None:
+                child = {"_refs": 0}
+                node[chunk_hash] = child
+            child["_refs"] += 1
+            node = child
+
+        # (Re)inserting the same sequence refreshes its recency.
+        if seq_key in self._sequences:
+            self._sequences.move_to_end(seq_key)
+        else:
+            self._sequences[seq_key] = [h for h, _ in chunks]
+
+        evicted = False
+        while len(self._sequences) > self._max_prefixes:
             self._evict_oldest()
             evicted = True
         return evicted
+
+    def _evict_oldest(self):
+        """Drop the oldest inserted sequence, pruning nodes whose refcount hits 0."""
+        seq_key, chunk_hashes = self._sequences.popitem(last=False)
+        node = self._root
+        path = []  # (parent_dict, chunk_hash, child_node)
+        for chunk_hash in chunk_hashes:
+            child = node.get(chunk_hash)
+            if child is None:
+                break  # already partially gone
+            path.append((node, chunk_hash, child))
+            node = child
+        # Decrement refcounts in reverse so we can delete emptied nodes.
+        for parent, chunk_hash, child in reversed(path):
+            child["_refs"] -= 1
+            if child["_refs"] <= 0:
+                del parent[chunk_hash]
 
 
 # ── Metrics counters (thread-safe) ──
@@ -169,9 +179,14 @@ def _generate_content(messages: list, max_tokens: int) -> str:
 
 
 def _update_metrics_on_request(messages: list, model: str):
-    """Simulate HBM + external prefix cache using trie-based prefix matching."""
+    """Simulate HBM + external prefix cache using trie-based prefix matching.
+
+    Also marks the request as in-flight (``requests_running``) — the caller must
+    pair this with :func:`_release_request_slot` once streaming completes.
+    """
     with _metrics_lock:
         _metrics_counters["requests_total"] += 1
+        _metrics_counters["requests_running"] += 1
         prompt_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
         _metrics_counters["prompt_tokens_total"] += prompt_tokens
 
@@ -196,6 +211,13 @@ def _update_metrics_on_request(messages: list, model: str):
         evicted = _hbm_trie.insert(chunks)
         if evicted:
             _metrics_counters["prefix_cache_evictions"] += 1
+
+
+def _release_request_slot():
+    """Decrement the in-flight request counter (call when a request finishes)."""
+    with _metrics_lock:
+        if _metrics_counters["requests_running"] > 0:
+            _metrics_counters["requests_running"] -= 1
 
 
 def _update_metrics_on_complete(output_tokens: int):
@@ -232,45 +254,53 @@ async def stream_response(
     ttft_ms: float = TTFT_MS,
     tpot_ms: float = TPOT_MS,
 ) -> AsyncGenerator[str, None]:
-    """Stream tokens one-by-one with realistic TTFT + TPOT delays."""
-    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-    content = _generate_content(messages, max_tokens)
-    input_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
-    output_tokens = _estimate_tokens(content)
+    """Stream tokens one-by-one with realistic TTFT + TPOT delays.
 
-    # TTFT: wait before first token
-    await asyncio.sleep(ttft_ms / 1000)
+    Wraps the whole body in try/finally so the in-flight request slot is released
+    even if the client disconnects mid-stream (Starlette closes the generator,
+    triggering the finally via GeneratorExit).
+    """
+    try:
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        content = _generate_content(messages, max_tokens)
+        input_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
+        output_tokens = _estimate_tokens(content)
 
-    # Role chunk
-    yield make_chunk(chunk_id, model)
+        # TTFT: wait before first token
+        await asyncio.sleep(ttft_ms / 1000)
 
-    # Token-by-token streaming (1 token ≈ CHARS_PER_TOKEN chars per chunk)
-    for i in range(0, len(content), CHARS_PER_TOKEN):
-        chunk_content = content[i : i + CHARS_PER_TOKEN]
-        yield make_chunk(chunk_id, model, content=chunk_content)
-        # TPOT delay between tokens
-        await asyncio.sleep(tpot_ms / 1000)
+        # Role chunk
+        yield make_chunk(chunk_id, model)
 
-    # Final chunk with finish_reason (no usage here due to evalscope's elif bug)
-    yield make_chunk(chunk_id, model, finish=True)
+        # Token-by-token streaming (1 token ≈ CHARS_PER_TOKEN chars per chunk)
+        for i in range(0, len(content), CHARS_PER_TOKEN):
+            chunk_content = content[i : i + CHARS_PER_TOKEN]
+            yield make_chunk(chunk_id, model, content=chunk_content)
+            # TPOT delay between tokens
+            await asyncio.sleep(tpot_ms / 1000)
 
-    # Separate usage chunk (evalscope processes usage only when no choices)
-    usage = {
-        "prompt_tokens": input_tokens,
-        "completion_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
-    }
-    usage_chunk = {
-        "id": chunk_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": model,
-        "usage": usage,
-    }
-    yield f"data: {json.dumps(usage_chunk)}\n\n"
-    yield "data: [DONE]\n\n"
+        # Final chunk with finish_reason (no usage here due to evalscope's elif bug)
+        yield make_chunk(chunk_id, model, finish=True)
 
-    _update_metrics_on_complete(output_tokens)
+        # Separate usage chunk (evalscope processes usage only when no choices)
+        usage = {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+        usage_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "usage": usage,
+        }
+        yield f"data: {json.dumps(usage_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+        _update_metrics_on_complete(output_tokens)
+    finally:
+        _release_request_slot()
 
 
 @app.post("/v1/chat/completions")
@@ -298,30 +328,33 @@ async def chat_completions(request: Request):
         )
 
     # Non-streaming: still simulate TTFT + total time
-    await asyncio.sleep(req_ttft / 1000 + req_tpot * max_tokens / 1000)
-    content = _generate_content(messages, max_tokens)
-    input_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
-    output_tokens = _estimate_tokens(content)
-    _update_metrics_on_complete(output_tokens)
+    try:
+        await asyncio.sleep(req_ttft / 1000 + req_tpot * max_tokens / 1000)
+        content = _generate_content(messages, max_tokens)
+        input_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
+        output_tokens = _estimate_tokens(content)
+        _update_metrics_on_complete(output_tokens)
 
-    return JSONResponse({
-        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-        },
-    })
+        return JSONResponse({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+        })
+    finally:
+        _release_request_slot()
 
 
 @app.get("/metrics")

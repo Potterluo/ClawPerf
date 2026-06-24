@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 
 from clawperf.config import BenchmarkConfig
 
@@ -98,11 +99,21 @@ def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
 
 def main():
     config = parse_args()
+
+    # Configure logging BEFORE importing the runner so that the setup phase
+    # (tokenizer load + content generation) produces visible, non-frozen output.
+    from clawperf.logging_setup import setup_logging
     from clawperf.runner import BenchmarkRunner
 
+    setup_logging(verbose=config.verbose)
     runner = BenchmarkRunner(config)
     try:
         asyncio.run(runner.run())
     except KeyboardInterrupt:
+        # Re-establish logging (the event loop + handlers were torn down).
+        setup_logging(verbose=config.verbose)
         print("\n[ClawPerf] Interrupted. Saving partial results...")
-        asyncio.run(runner.shutdown_and_save())
+        try:
+            asyncio.run(runner.shutdown_and_save())
+        except Exception as e:
+            print(f"[ClawPerf] Failed to save partial results: {e}", file=sys.stderr)

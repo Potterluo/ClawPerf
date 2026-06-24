@@ -61,6 +61,13 @@ class TokenizerManager:
         """Count tokens in a plain text string."""
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
+    def _tokenize_chat(self, messages: list[dict], add_generation_prompt: bool = True) -> list:
+        """Tokenize chat messages via EvalScope's helper (single import path)."""
+        from evalscope.perf.plugin.datasets.utils import tokenize_chat_messages
+        return tokenize_chat_messages(
+            self.tokenizer, messages, add_generation_prompt=add_generation_prompt
+        )
+
     def count_chat_tokens(self, messages: list[dict]) -> int:
         """Count tokens for chat-formatted messages.
 
@@ -69,8 +76,7 @@ class TokenizerManager:
         """
         # Check if tokenizer has chat_template
         if self.tokenizer.chat_template is not None:
-            from evalscope.perf.plugin.datasets.utils import tokenize_chat_messages
-            return len(tokenize_chat_messages(self.tokenizer, messages, add_generation_prompt=True))
+            return len(self._tokenize_chat(messages, add_generation_prompt=True))
 
         # Fallback: simple role/content format
         total_text = ""
@@ -86,8 +92,8 @@ class TokenizerManager:
         import json
         request = json.loads(request_json_str)
         if 'messages' in request:
-            from evalscope.perf.plugin.datasets.utils import tokenize_chat_messages
-            return len(tokenize_chat_messages(self.tokenizer, request['messages']))
+            # Match count_chat_tokens: include the generation prompt tokens.
+            return len(self._tokenize_chat(request['messages'], add_generation_prompt=True))
         elif 'prompt' in request:
             prompt = request['prompt']
             if isinstance(prompt, list):
