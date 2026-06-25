@@ -13,16 +13,39 @@ import aiohttp
 logger = logging.getLogger("clawperf")
 
 VLLM_METRICS = {
-    "kv_cache_usage": "vllm:gpu_cache_usage_perc",
-    "num_running": "vllm:num_requests_running",
-    "num_waiting": "vllm:num_requests_waiting",
-    "prefix_cache_queries": "vllm:prefix_cache_queries_total",
-    "prefix_cache_evictions": "vllm:prefix_cache_evictions_total",
-    "prefix_cache_hit_tokens": "vllm:prefix_cache_hit_tokens_total",
-    "prefix_cache_query_tokens": "vllm:prefix_cache_query_tokens_total",
-    "external_prefix_cache_queries": "external_prefix_cache_queries_total",
-    "external_prefix_cache_hit_tokens": "external_prefix_cache_hit_tokens_total",
-    "external_prefix_cache_query_tokens": "external_prefix_cache_query_tokens_total",
+    # Real vLLM metric names. Each value is a list of candidate names tried in
+    # order so the poller is robust across vLLM versions:
+    #   - hit/query token counters: vllm:prefix_cache_{hits,queries}_total
+    #     (older builds dropped the _total suffix; some pre-V1 used *_tokens_total)
+    #   - external cache metrics have NO vllm: prefix (per aisbench reference)
+    #   - GPU KV usage: kv_cache_usage_perc (V1) vs gpu_cache_usage_perc (legacy)
+    "kv_cache_usage": ["vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"],
+    "num_running": ["vllm:num_requests_running"],
+    "num_waiting": ["vllm:num_requests_waiting"],
+    "prefix_cache_hit_tokens": [
+        "vllm:prefix_cache_hits_total",
+        "vllm:prefix_cache_hits",
+        "vllm:prefix_cache_hit_tokens_total",
+    ],
+    "prefix_cache_query_tokens": [
+        "vllm:prefix_cache_queries_total",
+        "vllm:prefix_cache_queries",
+        "vllm:prefix_cache_query_tokens_total",
+    ],
+    "prefix_cache_evictions": [
+        "vllm:prefix_cache_evictions_total",
+        "vllm:prefix_cache_evictions",
+    ],
+    "external_prefix_cache_hit_tokens": [
+        "external_prefix_cache_hits_total",
+        "external_prefix_cache_hits",
+        "vllm:external_prefix_cache_hits_total",
+    ],
+    "external_prefix_cache_query_tokens": [
+        "external_prefix_cache_queries_total",
+        "external_prefix_cache_queries",
+        "vllm:external_prefix_cache_queries_total",
+    ],
 }
 SGLANG_METRICS = {
     "cache_hit_rate": "sglang:cache_hit_rate",
@@ -72,6 +95,35 @@ def parse_prometheus_metrics(text: str) -> Dict[str, float]:
             # Labeled instance: aggregate into the base form by summing.
             result[base] = result.get(base, 0.0) + value
     return result
+
+
+def match_metrics(raw: Dict[str, float], metrics_map: Dict) -> Dict[str, float]:
+    """Map raw Prometheus keys to our internal names using candidate lists.
+
+    Each metrics_map value may be a single name (str) or an ordered list of
+    candidate names; the first match wins, making the poller robust across
+    backend versions that rename or drop the ``_total`` suffix.
+    """
+    sample: Dict[str, float] = {}
+    for our_name, candidates in metrics_map.items():
+        if isinstance(candidates, str):
+            candidates = [candidates]
+        for cand in candidates:
+            if cand in raw:
+                sample[our_name] = raw[cand]
+                break
+        else:
+            # Substring fallback for labeled variants whose summed base form
+            # wasn't produced (e.g. an unexpected suffix).
+            for cand in candidates:
+                base = cand.split("{")[0]
+                for key in raw:
+                    if base in key:
+                        sample[our_name] = raw[key]
+                        break
+                if our_name in sample:
+                    break
+    return sample
 
 
 class SystemMetricsPoller:
@@ -124,15 +176,7 @@ class SystemMetricsPoller:
             return None
         raw = parse_prometheus_metrics(text)
         sample = {"timestamp": time.time()}
-        for our_name, their_name in self.metrics_map.items():
-            if their_name in raw:
-                sample[our_name] = raw[their_name]
-            else:
-                base = their_name.split("{")[0]
-                for key in raw:
-                    if base in key:
-                        sample[our_name] = raw[key]
-                        break
+        sample.update(match_metrics(raw, self.metrics_map))
         return sample
 
     async def snapshot(self) -> Optional[Dict]:
