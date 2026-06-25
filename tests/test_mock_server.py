@@ -5,6 +5,7 @@ from __future__ import annotations
 from clawperf.mock_server import (
     SUPPORTED_MODELS,
     PrefixCacheTrie,
+    _content_to_text,
     _estimate_tokens,
     _generate_content,
     _messages_to_chunks,
@@ -15,6 +16,25 @@ def test_estimate_tokens():
     assert _estimate_tokens("hello world") == 2
     assert _estimate_tokens("") == 1
     assert _estimate_tokens("a") == 1
+
+
+def test_content_to_text_normalizes_none_and_list():
+    """OpenAI allows content=null or a multipart array — both must not crash."""
+    assert _content_to_text(None) == ""
+    assert _content_to_text("hi") == "hi"
+    assert _content_to_text([{"type": "text", "text": "hello "},
+                             {"type": "text", "text": "world"}]) == "hello world"
+    assert _content_to_text([{"type": "image_url"}]) == ""
+
+
+def test_messages_to_chunks_with_odd_content():
+    # None and list content used to raise TypeError; now they normalize.
+    chunks = _messages_to_chunks([
+        {"role": "system", "content": None},
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+    ])
+    assert len(chunks) == 2
+    assert all(isinstance(c, tuple) for c in chunks)
 
 
 def test_generate_content_short():

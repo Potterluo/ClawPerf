@@ -139,3 +139,20 @@ def test_prefix_cache_delta_no_external_keys():
     assert delta["external_prefix_cache_hit_tokens_delta"] == 0
     assert delta["external_prefix_cache_query_tokens_delta"] == 0
     assert "external_prefix_cache_token_hit_rate" not in delta
+
+
+def test_prefix_cache_delta_counter_reset():
+    """If the backend restarted mid-run, counters go backwards. The delta must
+    be flagged and the hit rate must NOT be computed (a negative delta would
+    otherwise produce a bogus rate)."""
+    poller = SystemMetricsPoller("http://localhost:8000/metrics", 5, "vllm")
+    start = {"prefix_cache_hit_tokens": 1000, "prefix_cache_query_tokens": 2000,
+             "external_prefix_cache_hit_tokens": 100, "external_prefix_cache_query_tokens": 200}
+    end = {"prefix_cache_hit_tokens": 100, "prefix_cache_query_tokens": 200,
+           "external_prefix_cache_hit_tokens": 10, "external_prefix_cache_query_tokens": 20}
+    delta = poller.compute_prefix_cache_delta(start, end)
+    assert delta is not None
+    assert delta.get("prefix_cache_counter_reset") is True
+    assert delta.get("external_prefix_cache_counter_reset") is True
+    assert "prefix_cache_token_hit_rate" not in delta
+    assert "external_prefix_cache_token_hit_rate" not in delta

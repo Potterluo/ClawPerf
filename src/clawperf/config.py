@@ -64,16 +64,44 @@ class BenchmarkConfig:
         if self.user_arrival == "burst":
             self.arrival_mode = "burst"
             self.arrival_param = 0.0
-        elif self.user_arrival.startswith("steady:"):
+            return
+
+        # Forms other than 'burst' must have a colon: 'steady:<n>' / 'poisson:<n>'.
+        if ":" not in self.user_arrival:
+            raise ValueError(
+                f"Invalid user_arrival format: {self.user_arrival!r}. "
+                "Expected 'burst', 'steady:<seconds>', or 'poisson:<lambda>'."
+            )
+
+        prefix, _, raw_param = self.user_arrival.partition(":")
+        try:
+            param = float(raw_param)
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"Invalid user_arrival format: {self.user_arrival!r}. "
+                "Expected 'burst', 'steady:<seconds>', or 'poisson:<lambda>' "
+                f"with a numeric value after the colon (got {raw_param!r})."
+            )
+
+        if prefix == "steady":
+            if param < 0:
+                raise ValueError(
+                    f"steady arrival interval must be >= 0, got {param}."
+                )
             self.arrival_mode = "steady"
-            self.arrival_param = float(self.user_arrival.split(":")[1])
-        elif self.user_arrival.startswith("poisson:"):
+            self.arrival_param = param
+        elif prefix == "poisson":
+            # random.expovariate(lambda) divides by lambda — lambda==0 crashes.
+            if param <= 0:
+                raise ValueError(
+                    f"poisson arrival lambda must be > 0, got {param}."
+                )
             self.arrival_mode = "poisson"
-            self.arrival_param = float(self.user_arrival.split(":")[1])
+            self.arrival_param = param
         else:
             raise ValueError(
                 f"Invalid user_arrival format: {self.user_arrival!r}. "
-                "Expected 'burst', 'steady:<interval>', or 'poisson:<lambda>'."
+                "Expected 'burst', 'steady:<seconds>', or 'poisson:<lambda>'."
             )
 
     def to_evalscope_args(self):

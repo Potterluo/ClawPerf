@@ -153,6 +153,29 @@ _hbm_trie = PrefixCacheTrie()
 _ext_trie = PrefixCacheTrie()
 
 
+def _content_to_text(content) -> str:
+    """Normalize a message's content to a string.
+
+    OpenAI allows content to be null or an array of content parts
+    (e.g. [{"type":"text","text":"hi"}]); both would otherwise crash the
+    trie's hash()/len() logic.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # Concatenate the text field of each part (multimodal-safe).
+        parts = []
+        for p in content:
+            if isinstance(p, dict):
+                parts.append(str(p.get("text", "")))
+            else:
+                parts.append(str(p))
+        return "".join(parts)
+    return str(content)
+
+
 def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN)
 
@@ -161,14 +184,14 @@ def _messages_to_chunks(messages: list) -> list[tuple[str, int]]:
     """Convert a messages list into trie chunks: (content_hash, estimated_tokens)."""
     chunks = []
     for m in messages:
-        content = m.get("content", "")
-        chunks.append((hash(content), _estimate_tokens(content)))
+        text = _content_to_text(m.get("content", ""))
+        chunks.append((hash(text), _estimate_tokens(text)))
     return chunks
 
 
 def _generate_content(messages: list, max_tokens: int) -> str:
     """Generate filler content targeting ~max_tokens tokens."""
-    last_content = messages[-1].get("content", "")[:50] if messages else "Hello"
+    last_content = _content_to_text(messages[-1].get("content", ""))[:50] if messages else "Hello"
     target_chars = max_tokens * CHARS_PER_TOKEN
     response = last_content
     if len(response) < target_chars:
@@ -187,7 +210,7 @@ def _update_metrics_on_request(messages: list, model: str):
     with _metrics_lock:
         _metrics_counters["requests_total"] += 1
         _metrics_counters["requests_running"] += 1
-        prompt_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
+        prompt_tokens = sum(_estimate_tokens(_content_to_text(m.get("content", ""))) for m in messages)
         _metrics_counters["prompt_tokens_total"] += prompt_tokens
 
         chunks = _messages_to_chunks(messages)
@@ -263,7 +286,7 @@ async def stream_response(
     try:
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         content = _generate_content(messages, max_tokens)
-        input_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
+        input_tokens = sum(_estimate_tokens(_content_to_text(m.get("content", ""))) for m in messages)
         output_tokens = _estimate_tokens(content)
 
         # TTFT: wait before first token
@@ -331,7 +354,7 @@ async def chat_completions(request: Request):
     try:
         await asyncio.sleep(req_ttft / 1000 + req_tpot * max_tokens / 1000)
         content = _generate_content(messages, max_tokens)
-        input_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
+        input_tokens = sum(_estimate_tokens(_content_to_text(m.get("content", ""))) for m in messages)
         output_tokens = _estimate_tokens(content)
         _update_metrics_on_complete(output_tokens)
 

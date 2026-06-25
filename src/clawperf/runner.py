@@ -114,6 +114,7 @@ class BenchmarkRunner:
         self._bench_start_time: float = 0.0
         self._user_tasks: List[asyncio.Task] = []
         self._completed_turns: int = 0
+        self._error_count: int = 0  # incremental error count for progress bar
         self._total_turns: int = 0
         self._pbar = None
         self._signal_installed = False
@@ -317,7 +318,20 @@ class BenchmarkRunner:
 
             request_body = self._api_plugin.build_request(messages)
             if request_body is None:
+                # EvalScope returns None when request construction throws; the
+                # turn must still be recorded and counted so the progress bar
+                # reaches total and the failure shows up in results.
                 logger.warning("[User %02d] Turn %d: failed to build request", user_id, turn_id)
+                turn_record = {
+                    "user_id": user_id,
+                    "turn_id": turn_id,
+                    "success": False,
+                    "error_type": "build_request_failed",
+                    "context_tokens": context_tokens,
+                    "compaction_triggered": turn_result["compaction_triggered"],
+                }
+                self._turn_records.append(turn_record)
+                self._advance_progress(turn_record)
                 continue
 
             wall_start = time.monotonic()
@@ -363,13 +377,15 @@ class BenchmarkRunner:
     def _advance_progress(self, turn_record: dict):
         """Update progress bar or print verbose turn line."""
         self._completed_turns += 1
+        # Track errors incrementally (O(1)) instead of re-scanning all records
+        # every turn — the old O(n) scan made progress updates O(n^2) overall.
+        if not turn_record.get("success", False):
+            self._error_count += 1
 
         if self.config.verbose:
             self._print_verbose_turn(turn_record)
         elif self._pbar:
-            success = turn_record.get("success", False)
-            n_err = sum(1 for t in self._turn_records if not t.get("success"))
-            self._pbar.set_postfix_str(f"err={n_err}")
+            self._pbar.set_postfix_str(f"err={self._error_count}")
             self._pbar.update(1)
 
     def _print_verbose_turn(self, t: dict):

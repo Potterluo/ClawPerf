@@ -36,6 +36,31 @@ class TestBenchmarkConfig:
         with pytest.raises(ValueError, match="Invalid user_arrival"):
             BenchmarkConfig(endpoint="http://x", model="m", user_arrival="invalid")
 
+    def test_invalid_arrival_no_colon(self):
+        with pytest.raises(ValueError, match="Invalid user_arrival"):
+            BenchmarkConfig(endpoint="http://x", model="m", user_arrival="steady")
+
+    def test_steady_empty_param(self):
+        with pytest.raises(ValueError, match="Invalid user_arrival"):
+            BenchmarkConfig(endpoint="http://x", model="m", user_arrival="steady:")
+
+    def test_steady_non_numeric(self):
+        with pytest.raises(ValueError, match="Invalid user_arrival"):
+            BenchmarkConfig(endpoint="http://x", model="m", user_arrival="steady:abc")
+
+    def test_steady_negative(self):
+        with pytest.raises(ValueError, match="steady arrival interval must be >= 0"):
+            BenchmarkConfig(endpoint="http://x", model="m", user_arrival="steady:-1")
+
+    def test_poisson_zero(self):
+        # random.expovariate(0) would ZeroDivisionError — must be rejected up front.
+        with pytest.raises(ValueError, match="poisson arrival lambda must be > 0"):
+            BenchmarkConfig(endpoint="http://x", model="m", user_arrival="poisson:0")
+
+    def test_poisson_negative(self):
+        with pytest.raises(ValueError, match="poisson arrival lambda must be > 0"):
+            BenchmarkConfig(endpoint="http://x", model="m", user_arrival="poisson:-0.5")
+
     def test_tokenizer_defaults_to_model(self):
         cfg = BenchmarkConfig(endpoint="http://x", model="qwen3-32b", tokenizer="")
         assert cfg.tokenizer == "qwen3-32b"

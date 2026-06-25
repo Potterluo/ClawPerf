@@ -171,9 +171,32 @@ class SystemMetricsPoller:
         ext_delta_query_tokens = ext_query_tok_end - ext_query_tok_start
         ext_delta_hit_tokens = ext_hit_tok_end - ext_hit_tok_start
 
-        if delta_query_tokens > 0:
+        # If any counter went backwards, the backend restarted mid-benchmark
+        # (counters reset to 0). A negative delta is meaningless and would
+        # produce a bogus hit rate, so flag it and skip the rate computation.
+        if delta_query_tokens < 0 or delta_hit_tokens < 0:
+            result["prefix_cache_counter_reset"] = True
+            logger.warning(
+                "Prefix cache counters decreased during the run "
+                "(query %d -> %d, hit %d -> %d) — backend likely restarted; "
+                "hit rate not computed.",
+                query_tok_start, query_tok_end, hit_tok_start, hit_tok_end,
+            )
+        elif delta_query_tokens > 0:
             result["prefix_cache_token_hit_rate"] = delta_hit_tokens / delta_query_tokens
-        if ext_delta_query_tokens > 0:
-            result["external_prefix_cache_token_hit_rate"] = ext_delta_hit_tokens / ext_delta_query_tokens
+
+        if ext_delta_query_tokens < 0 or ext_delta_hit_tokens < 0:
+            result["external_prefix_cache_counter_reset"] = True
+            logger.warning(
+                "External prefix cache counters decreased during the run "
+                "(query %d -> %d, hit %d -> %d) — backend likely restarted; "
+                "hit rate not computed.",
+                ext_query_tok_start, ext_query_tok_end,
+                ext_hit_tok_start, ext_hit_tok_end,
+            )
+        elif ext_delta_query_tokens > 0:
+            result["external_prefix_cache_token_hit_rate"] = (
+                ext_delta_hit_tokens / ext_delta_query_tokens
+            )
 
         return result
