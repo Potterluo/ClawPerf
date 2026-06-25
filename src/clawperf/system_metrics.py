@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Dict, List, Optional
 
@@ -57,6 +58,11 @@ def parse_prometheus_metrics(text: str) -> Dict[str, float]:
             try:
                 value = float(parts[1])
             except ValueError:
+                continue
+            # Reject non-finite values (NaN/Inf): a backend may emit "NaN" for
+            # an undefined ratio; storing it would poison every delta/hit-rate
+            # computation with NaN propagation.
+            if not math.isfinite(value):
                 continue
             result[parts[0]] = value
             base = parts[0].split("{")[0]

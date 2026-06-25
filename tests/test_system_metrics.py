@@ -43,6 +43,13 @@ def test_parse_prometheus_no_label_not_doubled():
     assert result["vllm:gpu_cache_usage_perc"] == 0.45
 
 
+def test_parse_prometheus_rejects_nan_inf():
+    """NaN/Inf would poison delta/hit-rate math via NaN propagation — skip them."""
+    text = "vllm:gpu_cache_usage_perc NaN\nvllm:num_requests_running inf\nvllm:num_requests_waiting -inf\n"
+    result = parse_prometheus_metrics(text)
+    assert result == {}  # all non-finite values dropped
+
+
 def test_parse_prometheus_comments_and_empty():
     text = "# HELP some metric\n# TYPE some counter\n\nvllm:gpu_cache_usage_perc 0.5\n"
     result = parse_prometheus_metrics(text)

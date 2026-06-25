@@ -43,6 +43,18 @@ def test_generate_content_short():
     assert len(content) > 0
 
 
+def test_generate_content_zero_tokens():
+    """max_tokens=0 must yield empty content (regression: returned ~12 tokens)."""
+    assert _generate_content([{"role": "user", "content": "hi"}], max_tokens=0) == ""
+
+
+def test_generate_content_caps_at_target():
+    """Small max_tokens must not over-generate the 50-char seed."""
+    content = _generate_content([{"role": "user", "content": "a" * 100}], max_tokens=3)
+    # 3 tokens * 4 chars/token = 12 chars max
+    assert len(content) == 12
+
+
 def test_generate_content_long():
     messages = [{"role": "user", "content": "test"}]
     content = _generate_content(messages, max_tokens=100)

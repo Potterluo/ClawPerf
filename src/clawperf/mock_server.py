@@ -190,15 +190,22 @@ def _messages_to_chunks(messages: list) -> list[tuple[str, int]]:
 
 
 def _generate_content(messages: list, max_tokens: int) -> str:
-    """Generate filler content targeting ~max_tokens tokens."""
-    last_content = _content_to_text(messages[-1].get("content", ""))[:50] if messages else "Hello"
-    target_chars = max_tokens * CHARS_PER_TOKEN
-    response = last_content
-    if len(response) < target_chars:
-        filler_needed = target_chars - len(response)
-        cycles = (filler_needed // len(FILLER_TEXT)) + 1
-        response += " " + (FILLER_TEXT * cycles)[:filler_needed]
-    return response
+    """Generate filler content targeting ~max_tokens tokens.
+
+    Always caps at the requested length: max_tokens=0 yields "", and small
+    max_tokens no longer over-generates a 50-char seed.
+    """
+    target_chars = max(0, max_tokens) * CHARS_PER_TOKEN
+    if target_chars == 0:
+        return ""
+    # Seed with a slice of the last user message (mimics echo), then pad with
+    # filler text until the target character count is reached.
+    seed = (_content_to_text(messages[-1].get("content", ""))[:50]) if messages else "Hello"
+    if len(seed) >= target_chars:
+        return seed[:target_chars]
+    filler_needed = target_chars - len(seed)
+    cycles = (filler_needed // len(FILLER_TEXT)) + 1
+    return (seed + " " + (FILLER_TEXT * cycles))[:target_chars]
 
 
 def _update_metrics_on_request(messages: list, model: str):
