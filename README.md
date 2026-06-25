@@ -246,21 +246,22 @@ Each simulated user maintains an independent conversation state with its own gro
 
 Each user's context follows this structure:
 
-```
-[System Prefix] [User Prefix] [History] [Current Input]
-```
+![Context model and compaction](docs/context_model.svg)
 
 When context reaches `--max-context-tokens`, append-mode compaction fires:
 
 1. The base context (system + user prefix + input, without history) is checked first. If it already exceeds the limit, compaction is skipped and the turn is marked as `context_overflow` — this prevents infinite compaction loops.
 2. Otherwise, history is cleared and the user prefix grows by `--compaction-prefix-increment` tokens.
 3. New random content fills the enlarged user prefix.
+4. If the grown base still exceeds the limit, the prefix growth is **reverted** (history cleared only) so the user isn't permanently trapped in overflow.
 
 This simulates how real LLM serving systems handle context overflow with prefix caching.
 
 ## Prefix Cache Simulation
 
 The mock server simulates vLLM's KV-block prefix cache using a trie:
+
+![Prefix cache reuse across turns](docs/prefix_cache.svg)
 
 - **HBM trie**: Represents GPU KV cache. Queried first for longest prefix match. Always updated after every request (mimicking vLLM storing all KV blocks regardless of hit/miss).
 - **External trie**: Represents CPU/disk prefix cache. Queried on HBM miss. Also always updated after every request.
@@ -274,6 +275,8 @@ The mock server simulates vLLM's KV-block prefix cache using a trie:
 - **poisson:0.5**: Users arrive following a Poisson process with rate 0.5
 
 ## Architecture
+
+![Benchmark pipeline](docs/architecture.svg)
 
 ClawPerf reuses EvalScope's core perf components:
 

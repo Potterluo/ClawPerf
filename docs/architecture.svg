@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 460" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+  <defs>
+    <style>
+      .ttl{font-size:17px;font-weight:700;fill:#0f172a}
+      .sub{font-size:12px;fill:#64748b}
+      .box{fill:#fff;stroke:#cbd5e1;stroke-width:1.4}
+      .core{fill:#eef2ff;stroke:#6366f1}
+      .ext{fill:#ecfdf5;stroke:#10b981}
+      .out{fill:#fff7ed;stroke:#f59e0b}
+      .bt{font-size:12px;font-weight:700;fill:#0f172a}
+      .bs{font-size:10px;fill:#475569}
+      .ln{stroke:#64748b;stroke-width:1.6;fill:none;marker-end:url(#ah2)}
+      .lnsoft{stroke:#94a3b8;stroke-width:1.4;fill:none;marker-end:url(#ah2);stroke-dasharray:5 4}
+      .pill{fill:#f1f5f9;stroke:#cbd5e1}
+      .ptxt{font-size:11px;font-weight:600;fill:#334155}
+      .note{font-size:11px;fill:#334155}
+    </style>
+    <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect width="900" height="460" fill="#ffffff"/>
+  <text x="24" y="34" class="ttl">Benchmark pipeline</text>
+  <text x="24" y="52" class="sub">Reuses EvalScope's HTTP/streaming/timing; ClawPerf adds the multi-turn, multi-user orchestration layer.</text>
+
+  <!-- CLI -->
+  <g>
+    <rect x="24" y="80" width="120" height="46" rx="8" class="box"/>
+    <text x="84" y="100" text-anchor="middle" class="bt">CLI</text>
+    <text x="84" y="116" text-anchor="middle" class="bs">cli.py</text>
+  </g>
+  <line x1="144" y1="103" x2="184" y2="103" class="ln"/>
+
+  <!-- Runner core -->
+  <g>
+    <rect x="186" y="68" width="190" height="160" rx="10" class="core"/>
+    <text x="281" y="88" text-anchor="middle" class="bt">BenchmarkRunner</text>
+    <text x="281" y="102" text-anchor="middle" class="bs">runner.py</text>
+    <!-- user loops -->
+    <rect x="200" y="116" width="80" height="26" rx="5" fill="#fff" stroke="#a5b4fc"/>
+    <text x="240" y="133" text-anchor="middle" class="bs">user-0 loop</text>
+    <rect x="286" y="116" width="80" height="26" rx="5" fill="#fff" stroke="#a5b4fc"/>
+    <text x="326" y="133" text-anchor="middle" class="bs">user-N loop</text>
+    <text x="281" y="158" text-anchor="middle" class="bs">context.py · scheduler.py</text>
+    <text x="281" y="174" text-anchor="middle" class="bs">asyncio tasks</text>
+    <text x="281" y="196" text-anchor="middle" class="bs">per-turn: prepare →</text>
+    <text x="281" y="210" text-anchor="middle" class="bs">post → finalize → record</text>
+  </g>
+
+  <!-- EvalScope client -->
+  <g>
+    <rect x="430" y="80" width="150" height="46" rx="8" class="ext"/>
+    <text x="505" y="100" text-anchor="middle" class="bt">AioHttpClient</text>
+    <text x="505" y="116" text-anchor="middle" class="bs">EvalScope · streaming</text>
+  </g>
+  <line x1="376" y1="103" x2="428" y2="103" class="ln"/>
+
+  <!-- LLM endpoint -->
+  <g>
+    <rect x="640" y="80" width="150" height="46" rx="8" class="ext"/>
+    <text x="715" y="100" text-anchor="middle" class="bt">LLM Serving</text>
+    <text x="715" y="116" text-anchor="middle" class="bs">vLLM / SGLang / MindIE</text>
+  </g>
+  <line x1="580" y1="103" x2="638" y2="103" class="ln"/>
+
+  <!-- metrics poller -->
+  <g>
+    <rect x="430" y="150" width="150" height="46" rx="8" class="ext"/>
+    <text x="505" y="170" text-anchor="middle" class="bt">SystemMetricsPoller</text>
+    <text x="505" y="186" text-anchor="middle" class="bs">Prometheus /metrics</text>
+  </g>
+  <line x1="715" y1="128" x2="715" y2="173" class="lnsoft"/>
+  <line x1="715" y1="173" x2="582" y2="173" class="lnsoft"/>
+  <text x="640" y="166" class="bs">poll</text>
+
+  <!-- finalize / output -->
+  <g>
+    <rect x="186" y="250" width="190" height="40" rx="8" class="out"/>
+    <text x="281" y="275" text-anchor="middle" class="bt">_finalize()</text>
+  </g>
+  <line x1="281" y1="230" x2="281" y2="248" class="ln"/>
+
+  <g>
+    <rect x="60" y="320" width="180" height="50" rx="8" class="out"/>
+    <text x="150" y="340" text-anchor="middle" class="bt">results.json</text>
+    <text x="150" y="356" text-anchor="middle" class="bs">config + summary + turns</text>
+  </g>
+  <g>
+    <rect x="280" y="320" width="180" height="50" rx="8" class="out"/>
+    <text x="370" y="340" text-anchor="middle" class="bt">history.jsonl</text>
+    <text x="370" y="356" text-anchor="middle" class="bs">append per run</text>
+  </g>
+  <g>
+    <rect x="500" y="320" width="180" height="50" rx="8" class="out"/>
+    <text x="590" y="340" text-anchor="middle" class="bt">console tables</text>
+    <text x="590" y="356" text-anchor="middle" class="bs">per-user + percentiles</text>
+  </g>
+  <line x1="281" y1="292" x2="150" y2="318" class="ln"/>
+  <line x1="281" y1="292" x2="370" y2="318" class="ln"/>
+  <line x1="281" y1="292" x2="590" y2="318" class="ln"/>
+
+  <!-- timing note -->
+  <g transform="translate(24,400)">
+    <rect x="0" y="0" width="852" height="44" rx="8" class="pill"/>
+    <text x="16" y="20" class="ptxt">Two-phase timing</text>
+    <text x="16" y="36" class="note">setup_time_s (tokenizer + content gen, off the event loop) is separated from bench_time_s (request window only) — reported Duration excludes setup.</text>
+  </g>
+</svg>

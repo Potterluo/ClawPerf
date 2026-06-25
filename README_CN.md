@@ -246,15 +246,14 @@ jq -c '{users: .config.num_users, bench_s: .timing.bench_time_s,
 
 每个用户的上下文遵循此结构：
 
-```
-[系统前缀] [用户前缀] [历史对话] [当前输入]
-```
+![上下文模型与压缩](docs/context_model.svg)
 
 当上下文达到 `--max-context-tokens` 时，触发追加模式压缩：
 
 1. 先检查基础上下文（系统 + 用户前缀 + 输入，不含历史）是否已超限。若已超限，跳过压缩并标记 `context_overflow` —— 这防止了无限压缩循环。
 2. 否则，清空历史对话，用户前缀增长 `--compaction-prefix-increment` tokens。
 3. 用新的随机内容填充增长后的用户前缀。
+4. 若增长后基础上下文仍超限，则**回退前缀增长**（仅清空历史），避免用户被永久困在溢出状态。
 
 这模拟了真实 LLM Serving 系统利用 prefix cache 处理上下文溢出的方式。
 
@@ -262,10 +261,12 @@ jq -c '{users: .config.num_users, bench_s: .timing.bench_time_s,
 
 Mock 服务器使用 Trie 模拟 vLLM 的 KV-block prefix cache：
 
+![跨轮 prefix cache 复用](docs/prefix_cache.svg)
+
 - **HBM Trie**：代表 GPU KV 缓存。优先查询最长前缀匹配。每次请求后都会更新（模拟 vLLM 无论命中与否都存储所有 KV block）。
 - **外部 Trie**：代表 CPU/磁盘 prefix cache。HBM miss 时查询。同样每次请求后都更新。
 - **Token 级命中率**：`prefix_cache_hit_tokens / prefix_cache_query_tokens` —— prompt token 中复用 KV block 的比例。这是有意义的指标；不报告请求级（二元）命中率。
-- **驱逐**：当 Trie 超过 `max_prefixes`（200）时，驱逐最旧的叶节点。
+- **驱逐**：当 Trie 超过 `max_prefixes`（200）时，按完整请求路径 LRU 驱逐最旧条目（引用计数保证共享前缀在仍被引用时不被删除）。
 
 ## 用户到达调度
 
@@ -274,6 +275,8 @@ Mock 服务器使用 Trie 模拟 vLLM 的 KV-block prefix cache：
 - **poisson:0.5**：用户按 Poisson 过程到达，平均速率 0.5 个/秒
 
 ## 架构
+
+![基准测试流水线](docs/architecture.svg)
 
 ClawPerf 复用 EvalScope 的核心 perf 组件：
 

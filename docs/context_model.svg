@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 420" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+  <defs>
+    <style>
+      .ttl{font-size:17px;font-weight:700;fill:#0f172a}
+      .sub{font-size:12px;fill:#64748b}
+      .seg{font-size:12px;font-weight:600;fill:#fff}
+      .lbl{font-size:11px;fill:#475569}
+      .note{font-size:11px;fill:#334155}
+      .arr{stroke:#64748b;stroke-width:1.6;fill:none;marker-end:url(#ah)}
+      .pill{fill:#f1f5f9;stroke:#cbd5e1}
+      .ptxt{font-size:11px;font-weight:600;fill:#334155}
+    </style>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect width="880" height="420" fill="#ffffff"/>
+
+  <text x="24" y="34" class="ttl">Per-turn context structure</text>
+  <text x="24" y="52" class="sub">Every turn re-sends the full accumulated context — this is what stresses KV caching.</text>
+
+  <!-- context bar -->
+  <g transform="translate(24,86)">
+    <rect x="0" y="0" width="150" height="42" rx="6" fill="#6366f1"/>
+    <text x="75" y="26" text-anchor="middle" class="seg">System Prefix</text>
+    <rect x="152" y="0" width="110" height="42" rx="6" fill="#0ea5e9"/>
+    <text x="207" y="26" text-anchor="middle" class="seg">User Prefix</text>
+    <rect x="264" y="0" width="220" height="42" rx="6" fill="#f59e0b"/>
+    <text x="374" y="26" text-anchor="middle" class="seg">History (grows each turn)</text>
+    <rect x="486" y="0" width="120" height="42" rx="6" fill="#10b981"/>
+    <text x="546" y="26" text-anchor="middle" class="seg">Current Input</text>
+
+    <text x="0" y="60" class="lbl">shared by all users</text>
+    <text x="152" y="60" class="lbl">per-user</text>
+    <text x="264" y="60" class="lbl">multi-turn tail</text>
+    <text x="486" y="60" class="lbl">this turn</text>
+
+    <!-- max context bracket -->
+    <path d="M0,76 L606,76" stroke="#ef4444" stroke-width="2" stroke-dasharray="5 4"/>
+    <text x="612" y="80" class="lbl" fill="#ef4444">max_context_tokens</text>
+  </g>
+
+  <!-- compaction flow -->
+  <text x="24" y="200" class="ttl">Append-mode compaction (on overflow)</text>
+  <text x="24" y="218" class="sub">When context ≥ limit: clear history, grow user prefix to retain a summary. If grown base still overflows, revert growth.</text>
+
+  <g transform="translate(24,240)">
+    <!-- before -->
+    <rect x="0" y="0" width="60" height="34" rx="5" fill="#6366f1"/>
+    <text x="30" y="22" text-anchor="middle" class="seg">sys</text>
+    <rect x="62" y="0" width="50" height="34" rx="5" fill="#0ea5e9"/>
+    <text x="87" y="22" text-anchor="middle" class="seg">usr</text>
+    <rect x="114" y="0" width="150" height="34" rx="5" fill="#f59e0b"/>
+    <text x="189" y="22" text-anchor="middle" class="seg">history (overflowing)</text>
+    <rect x="266" y="0" width="50" height="34" rx="5" fill="#10b981"/>
+    <text x="291" y="22" text-anchor="middle" class="seg">in</text>
+    <text x="0" y="-8" class="note">Before (turn N):</text>
+
+    <!-- arrow -->
+    <path d="M316,17 L360,17" class="arr"/>
+    <text x="338" y="9" text-anchor="middle" class="note">compact</text>
+
+    <!-- after -->
+    <rect x="376" y="0" width="60" height="34" rx="5" fill="#6366f1"/>
+    <text x="406" y="22" text-anchor="middle" class="seg">sys</text>
+    <rect x="438" y="0" width="90" height="34" rx="5" fill="#0ea5e9"/>
+    <text x="483" y="22" text-anchor="middle" class="seg">usr (+incr)</text>
+    <rect x="530" y="0" width="50" height="34" rx="5" fill="#10b981"/>
+    <text x="555" y="22" text-anchor="middle" class="seg">in</text>
+    <text x="376" y="-8" class="note">After: history cleared, prefix grown</text>
+  </g>
+
+  <!-- guard note -->
+  <g transform="translate(24,330)">
+    <rect x="0" y="0" width="832" height="64" rx="8" class="pill"/>
+    <text x="16" y="24" class="ptxt">Infinite-loop guards</text>
+    <text x="16" y="44" class="note">• If base (sys + usr + input) already ≥ limit → skip compaction, mark context_overflow (validated at startup).</text>
+    <text x="16" y="58" class="note">• If grown base still ≥ limit → revert growth so the user isn't permanently trapped in overflow.</text>
+  </g>
+</svg>
