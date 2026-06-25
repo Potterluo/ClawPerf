@@ -261,8 +261,6 @@ This simulates how real LLM serving systems handle context overflow with prefix 
 
 The mock server simulates vLLM's KV-block prefix cache using a trie:
 
-![Prefix cache reuse across turns](docs/prefix_cache.svg)
-
 - **HBM trie**: Represents GPU KV cache. Queried first for longest prefix match. Always updated after every request (mimicking vLLM storing all KV blocks regardless of hit/miss).
 - **External trie**: Represents CPU/disk prefix cache. Queried on HBM miss. Also always updated after every request.
 - **Token-level hit rate**: `prefix_cache_hit_tokens / prefix_cache_query_tokens` — the fraction of prompt tokens that reuse cached KV blocks. This is the meaningful metric; request-level (binary) hit rate is not reported.
@@ -270,13 +268,13 @@ The mock server simulates vLLM's KV-block prefix cache using a trie:
 
 ## User Arrival Scheduling
 
+![User arrival patterns](docs/arrival_patterns.svg)
+
 - **burst**: All users start immediately
 - **steady:2**: Users arrive every 2 seconds
 - **poisson:0.5**: Users arrive following a Poisson process with rate 0.5
 
 ## Architecture
-
-![Benchmark pipeline](docs/architecture.svg)
 
 ClawPerf reuses EvalScope's core perf components:
 

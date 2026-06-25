@@ -261,8 +261,6 @@ jq -c '{users: .config.num_users, bench_s: .timing.bench_time_s,
 
 Mock 服务器使用 Trie 模拟 vLLM 的 KV-block prefix cache：
 
-![跨轮 prefix cache 复用](docs/prefix_cache.svg)
-
 - **HBM Trie**：代表 GPU KV 缓存。优先查询最长前缀匹配。每次请求后都会更新（模拟 vLLM 无论命中与否都存储所有 KV block）。
 - **外部 Trie**：代表 CPU/磁盘 prefix cache。HBM miss 时查询。同样每次请求后都更新。
 - **Token 级命中率**：`prefix_cache_hit_tokens / prefix_cache_query_tokens` —— prompt token 中复用 KV block 的比例。这是有意义的指标；不报告请求级（二元）命中率。
@@ -270,13 +268,13 @@ Mock 服务器使用 Trie 模拟 vLLM 的 KV-block prefix cache：
 
 ## 用户到达调度
 
+![用户到达模式](docs/arrival_patterns.svg)
+
 - **burst**：所有用户立即开始
 - **steady:2**：每 2 秒加入 1 个新用户
 - **poisson:0.5**：用户按 Poisson 过程到达，平均速率 0.5 个/秒
 
 ## 架构
-
-![基准测试流水线](docs/architecture.svg)
 
 ClawPerf 复用 EvalScope 的核心 perf 组件：
 

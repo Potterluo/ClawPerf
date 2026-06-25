@@ -1,81 +1,112 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 420" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 470" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
   <defs>
     <style>
       .ttl{font-size:17px;font-weight:700;fill:#0f172a}
       .sub{font-size:12px;fill:#64748b}
-      .seg{font-size:12px;font-weight:600;fill:#fff}
-      .lbl{font-size:11px;fill:#475569}
+      .hdr{font-size:11px;font-weight:700;fill:#334155}
+      .blk{font-size:10px;font-weight:600;fill:#fff}
+      .blks{font-size:9px;font-weight:600;fill:#fff}
+      .row{font-size:10px;fill:#64748b}
+      .cmp{font-size:11px;font-weight:700;fill:#ef4444}
       .note{font-size:11px;fill:#334155}
-      .arr{stroke:#64748b;stroke-width:1.6;fill:none;marker-end:url(#ah)}
-      .pill{fill:#f1f5f9;stroke:#cbd5e1}
-      .ptxt{font-size:11px;font-weight:600;fill:#334155}
+      .lab{font-size:11px;font-weight:700;fill:#334155}
+      .pill{fill:#f8fafc;stroke:#e2e8f1}
     </style>
-    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
-    </marker>
   </defs>
 
-  <rect width="880" height="420" fill="#ffffff"/>
+  <rect width="900" height="470" fill="#ffffff"/>
+  <text x="24" y="32" class="ttl">Per-turn context growth &amp; compaction</text>
+  <text x="24" y="50" class="sub">Each row is the full prompt sent at that turn. System &amp; User columns stay left-aligned; history grows rightward until compaction clears it and grows the user prefix.</text>
 
-  <text x="24" y="34" class="ttl">Per-turn context structure</text>
-  <text x="24" y="52" class="sub">Every turn re-sends the full accumulated context — this is what stresses KV caching.</text>
+  <!-- column headers -->
+  <text x="92" y="86" text-anchor="middle" class="hdr">System prefix</text>
+  <text x="186" y="86" text-anchor="middle" class="hdr">User prefix</text>
+  <text x="232" y="86" class="hdr">History (prior turns, re-sent every turn) →</text>
+  <line x1="40" y1="92" x2="780" y2="92" stroke="#e2e8f0"/>
 
-  <!-- context bar -->
-  <g transform="translate(24,86)">
-    <rect x="0" y="0" width="150" height="42" rx="6" fill="#6366f1"/>
-    <text x="75" y="26" text-anchor="middle" class="seg">System Prefix</text>
-    <rect x="152" y="0" width="110" height="42" rx="6" fill="#0ea5e9"/>
-    <text x="207" y="26" text-anchor="middle" class="seg">User Prefix</text>
-    <rect x="264" y="0" width="220" height="42" rx="6" fill="#f59e0b"/>
-    <text x="374" y="26" text-anchor="middle" class="seg">History (grows each turn)</text>
-    <rect x="486" y="0" width="120" height="42" rx="6" fill="#10b981"/>
-    <text x="546" y="26" text-anchor="middle" class="seg">Current Input</text>
-
-    <text x="0" y="60" class="lbl">shared by all users</text>
-    <text x="152" y="60" class="lbl">per-user</text>
-    <text x="264" y="60" class="lbl">multi-turn tail</text>
-    <text x="486" y="60" class="lbl">this turn</text>
-
-    <!-- max context bracket -->
-    <path d="M0,76 L606,76" stroke="#ef4444" stroke-width="2" stroke-dasharray="5 4"/>
-    <text x="612" y="80" class="lbl" fill="#ef4444">max_context_tokens</text>
+  <!-- ===== Turn 1 ===== -->
+  <g>
+    <rect x="40" y="100" width="104" height="24" rx="5" fill="#6366f1"/><text x="92" y="116" text-anchor="middle" class="blk">System</text>
+    <rect x="148" y="100" width="76" height="24" rx="5" fill="#0ea5e9"/><text x="186" y="116" text-anchor="middle" class="blk">User0</text>
+    <rect x="228" y="100" width="42" height="24" rx="5" fill="#10b981"/><text x="249" y="116" text-anchor="middle" class="blk">Q1</text>
+    <text x="278" y="116" class="row">turn 1</text>
   </g>
 
-  <!-- compaction flow -->
-  <text x="24" y="200" class="ttl">Append-mode compaction (on overflow)</text>
-  <text x="24" y="218" class="sub">When context ≥ limit: clear history, grow user prefix to retain a summary. If grown base still overflows, revert growth.</text>
-
-  <g transform="translate(24,240)">
-    <!-- before -->
-    <rect x="0" y="0" width="60" height="34" rx="5" fill="#6366f1"/>
-    <text x="30" y="22" text-anchor="middle" class="seg">sys</text>
-    <rect x="62" y="0" width="50" height="34" rx="5" fill="#0ea5e9"/>
-    <text x="87" y="22" text-anchor="middle" class="seg">usr</text>
-    <rect x="114" y="0" width="150" height="34" rx="5" fill="#f59e0b"/>
-    <text x="189" y="22" text-anchor="middle" class="seg">history (overflowing)</text>
-    <rect x="266" y="0" width="50" height="34" rx="5" fill="#10b981"/>
-    <text x="291" y="22" text-anchor="middle" class="seg">in</text>
-    <text x="0" y="-8" class="note">Before (turn N):</text>
-
-    <!-- arrow -->
-    <path d="M316,17 L360,17" class="arr"/>
-    <text x="338" y="9" text-anchor="middle" class="note">compact</text>
-
-    <!-- after -->
-    <rect x="376" y="0" width="60" height="34" rx="5" fill="#6366f1"/>
-    <text x="406" y="22" text-anchor="middle" class="seg">sys</text>
-    <rect x="438" y="0" width="90" height="34" rx="5" fill="#0ea5e9"/>
-    <text x="483" y="22" text-anchor="middle" class="seg">usr (+incr)</text>
-    <rect x="530" y="0" width="50" height="34" rx="5" fill="#10b981"/>
-    <text x="555" y="22" text-anchor="middle" class="seg">in</text>
-    <text x="376" y="-8" class="note">After: history cleared, prefix grown</text>
+  <!-- ===== Turn 2 ===== -->
+  <g>
+    <rect x="40" y="132" width="104" height="24" rx="5" fill="#6366f1"/><text x="92" y="148" text-anchor="middle" class="blk">System</text>
+    <rect x="148" y="132" width="76" height="24" rx="5" fill="#0ea5e9"/><text x="186" y="148" text-anchor="middle" class="blk">User0</text>
+    <rect x="228" y="132" width="42" height="24" rx="5" fill="#10b981"/><text x="249" y="148" text-anchor="middle" class="blk">Q1</text>
+    <rect x="273" y="132" width="42" height="24" rx="5" fill="#f59e0b"/><text x="294" y="148" text-anchor="middle" class="blk">A1</text>
+    <rect x="318" y="132" width="42" height="24" rx="5" fill="#10b981"/><text x="339" y="148" text-anchor="middle" class="blk">Q2</text>
+    <text x="368" y="148" class="row">turn 2</text>
   </g>
 
-  <!-- guard note -->
-  <g transform="translate(24,330)">
-    <rect x="0" y="0" width="832" height="64" rx="8" class="pill"/>
-    <text x="16" y="24" class="ptxt">Infinite-loop guards</text>
-    <text x="16" y="44" class="note">• If base (sys + usr + input) already ≥ limit → skip compaction, mark context_overflow (validated at startup).</text>
-    <text x="16" y="58" class="note">• If grown base still ≥ limit → revert growth so the user isn't permanently trapped in overflow.</text>
+  <!-- ===== Turn 3 ===== -->
+  <g>
+    <rect x="40" y="164" width="104" height="24" rx="5" fill="#6366f1"/><text x="92" y="180" text-anchor="middle" class="blk">System</text>
+    <rect x="148" y="164" width="76" height="24" rx="5" fill="#0ea5e9"/><text x="186" y="180" text-anchor="middle" class="blk">User0</text>
+    <rect x="228" y="164" width="42" height="24" rx="5" fill="#10b981"/><text x="249" y="180" text-anchor="middle" class="blk">Q1</text>
+    <rect x="273" y="164" width="42" height="24" rx="5" fill="#f59e0b"/><text x="294" y="180" text-anchor="middle" class="blk">A1</text>
+    <rect x="318" y="164" width="42" height="24" rx="5" fill="#10b981"/><text x="339" y="180" text-anchor="middle" class="blk">Q2</text>
+    <rect x="363" y="164" width="42" height="24" rx="5" fill="#f59e0b"/><text x="384" y="180" text-anchor="middle" class="blk">A2</text>
+    <rect x="408" y="164" width="42" height="24" rx="5" fill="#10b981"/><text x="429" y="180" text-anchor="middle" class="blk">Q3</text>
+    <text x="458" y="180" class="row">turn 3</text>
+  </g>
+
+  <!-- ===== Turn n (long, with ellipsis) ===== -->
+  <g>
+    <rect x="40" y="196" width="104" height="24" rx="5" fill="#6366f1"/><text x="92" y="212" text-anchor="middle" class="blk">System</text>
+    <rect x="148" y="196" width="76" height="24" rx="5" fill="#0ea5e9"/><text x="186" y="212" text-anchor="middle" class="blk">User0</text>
+    <rect x="228" y="196" width="42" height="24" rx="5" fill="#10b981"/><text x="249" y="212" text-anchor="middle" class="blk">Q1</text>
+    <rect x="273" y="196" width="42" height="24" rx="5" fill="#f59e0b"/><text x="294" y="212" text-anchor="middle" class="blk">A1</text>
+    <rect x="318" y="196" width="42" height="24" rx="5" fill="#10b981"/><text x="339" y="212" text-anchor="middle" class="blk">Q2</text>
+    <rect x="363" y="196" width="42" height="24" rx="5" fill="#f59e0b"/><text x="384" y="212" text-anchor="middle" class="blk">A2</text>
+    <text x="416" y="212" class="row" font-weight="700">⋯</text>
+    <rect x="436" y="196" width="42" height="24" rx="5" fill="#10b981"/><text x="457" y="212" text-anchor="middle" class="blk">Qn</text>
+    <text x="486" y="212" class="row">turn n  (context ≥ limit)</text>
+  </g>
+
+  <!-- compaction divider -->
+  <line x1="40" y1="234" x2="560" y2="234" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="568" y="238" class="cmp">compaction</text>
+
+  <!-- ===== Turn n+1 (after compaction): User prefix grew = User0 + summary ===== -->
+  <g>
+    <rect x="40" y="250" width="104" height="24" rx="5" fill="#6366f1"/><text x="92" y="266" text-anchor="middle" class="blk">System</text>
+    <!-- original User0 portion (same width as above, left-aligned) -->
+    <rect x="148" y="250" width="76" height="24" rx="5" fill="#0ea5e9"/><text x="186" y="266" text-anchor="middle" class="blk">User0</text>
+    <!-- grown portion: compressed summary absorbed into the prefix -->
+    <rect x="226" y="250" width="44" height="24" rx="5" fill="#0369a1"/><text x="248" y="266" text-anchor="middle" class="blks">summary</text>
+    <rect x="274" y="250" width="42" height="24" rx="5" fill="#10b981"/><text x="295" y="266" text-anchor="middle" class="blk">Qn+1</text>
+    <text x="324" y="266" class="row">turn n+1  (history cleared, prefix grew → User1)</text>
+  </g>
+
+  <!-- ===== Annotations / legend (two columns, short wrapped lines) ===== -->
+  <g transform="translate(24,300)">
+    <rect x="0" y="0" width="852" height="150" rx="8" class="pill"/>
+
+    <!-- left column -->
+    <rect x="16" y="16" width="16" height="16" rx="4" fill="#6366f1"/>
+    <text x="40" y="29" class="lab">System prefix</text>
+    <text x="40" y="46" class="note">Agent memory, tool definitions, system prompt.</text>
+    <text x="40" y="61" class="note">Shared by all users; constant across turns.</text>
+
+    <rect x="16" y="78" width="16" height="16" rx="4" fill="#0ea5e9"/>
+    <rect x="34" y="78" width="16" height="16" rx="4" fill="#0369a1"/>
+    <text x="58" y="91" class="lab">User prefix  (User0 → User0 + summary = User1)</text>
+    <text x="40" y="108" class="note">User-specific context. On compaction it grows by</text>
+    <text x="40" y="123" class="note">absorbing a compressed summary of cleared history.</text>
+
+    <!-- right column -->
+    <rect x="448" y="16" width="16" height="16" rx="4" fill="#10b981"/>
+    <rect x="466" y="16" width="16" height="16" rx="4" fill="#f59e0b"/>
+    <text x="490" y="29" class="lab">History = prior Q &amp; A turns</text>
+    <text x="448" y="46" class="note">Re-sent in full every turn — exponentially growing,</text>
+    <text x="448" y="61" class="note">stresses KV/prefix caching. Cleared on compaction.</text>
+
+    <text x="448" y="91" class="lab">Compaction  (context ≥ max_context_tokens)</text>
+    <text x="448" y="108" class="note">Clear history; grow user prefix to retain a summary.</text>
+    <text x="448" y="123" class="note">Revert the growth if the grown base still overflows.</text>
   </g>
 </svg>
