@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import time
 from typing import Dict, List, Optional
 
@@ -97,6 +98,39 @@ def parse_prometheus_metrics(text: str) -> Dict[str, float]:
     return result
 
 
+_ENGINE_RE = re.compile(r'engine="(\d+)"')
+
+
+def extract_prefix_cache_per_engine(raw: Dict[str, float]) -> tuple[Dict, Dict]:
+    """Extract per-engine prefix-cache counters from labeled raw keys.
+
+    Returns ``(engines, external_engines)`` where each maps
+    ``{engine_id: {"hit_tokens": float, "query_tokens": float}}``.
+    Empty when the backend exposes no ``engine=`` labels (single-engine); the
+    summed totals from :func:`match_metrics` still apply in that case.
+    """
+    engines: Dict[str, Dict[str, float]] = {}
+    ext_engines: Dict[str, Dict[str, float]] = {}
+    for key, val in raw.items():
+        if "{" not in key:  # skip summed base form; only labeled series carry engine
+            continue
+        m = _ENGINE_RE.search(key)
+        if not m:
+            continue
+        eng = m.group(1)
+        base = key.split("{")[0]
+        # Check external first (its name also contains "prefix_cache").
+        if "external_prefix_cache_hit" in base:
+            ext_engines.setdefault(eng, {})["hit_tokens"] = val
+        elif "external_prefix_cache_quer" in base:
+            ext_engines.setdefault(eng, {})["query_tokens"] = val
+        elif "prefix_cache_hit" in base:  # vllm:prefix_cache_hits(_total)
+            engines.setdefault(eng, {})["hit_tokens"] = val
+        elif "prefix_cache_quer" in base:  # vllm:prefix_cache_queries(_total)
+            engines.setdefault(eng, {})["query_tokens"] = val
+    return engines, ext_engines
+
+
 def match_metrics(raw: Dict[str, float], metrics_map: Dict) -> Dict[str, float]:
     """Map raw Prometheus keys to our internal names using candidate lists.
 
@@ -130,6 +164,7 @@ class SystemMetricsPoller:
     def __init__(self, endpoint: str, interval: int, backend: str):
         self.endpoint = endpoint.rstrip("/")
         self.interval = interval
+        self.backend = backend
         self.metrics_map = BACKEND_MAP.get(backend, VLLM_METRICS)
         self._session: Optional[aiohttp.ClientSession] = None
         self._task: Optional[asyncio.Task] = None
@@ -175,8 +210,16 @@ class SystemMetricsPoller:
             logger.warning("Metrics endpoint request failed: %s", e)
             return None
         raw = parse_prometheus_metrics(text)
-        sample = {"timestamp": time.time()}
+        sample: Dict = {"timestamp": time.time()}
         sample.update(match_metrics(raw, self.metrics_map))
+        # Per-engine breakdown (vllm token counters labeled with engine="N").
+        # Empty for backends without engine labels; totals above still apply.
+        if self.backend == "vllm":
+            eng, ext_eng = extract_prefix_cache_per_engine(raw)
+            if eng:
+                sample["prefix_cache_engines"] = eng
+            if ext_eng:
+                sample["external_prefix_cache_engines"] = ext_eng
         return sample
 
     async def snapshot(self) -> Optional[Dict]:
@@ -249,4 +292,37 @@ class SystemMetricsPoller:
                 ext_delta_hit_tokens / ext_delta_query_tokens
             )
 
+        # Per-engine breakdown (vllm): delta + rate for each engine label present
+        # in either snapshot, plus external engines.
+        result["prefix_cache_engines"] = self._engine_deltas(
+            (start or {}).get("prefix_cache_engines", {}),
+            (end or {}).get("prefix_cache_engines", {}),
+        )
+        result["external_prefix_cache_engines"] = self._engine_deltas(
+            (start or {}).get("external_prefix_cache_engines", {}),
+            (end or {}).get("external_prefix_cache_engines", {}),
+        )
+
         return result
+
+    @staticmethod
+    def _engine_deltas(
+        start_eng: Dict[str, Dict], end_eng: Dict[str, Dict]
+    ) -> Dict[str, Dict]:
+        """Per-engine query/hit deltas and hit rate from start/end snapshots."""
+        out: Dict[str, Dict] = {}
+        for eng in sorted(set(start_eng) | set(end_eng)):
+            s = start_eng.get(eng, {})
+            e = end_eng.get(eng, {})
+            q_d = (e.get("query_tokens", 0) or 0) - (s.get("query_tokens", 0) or 0)
+            h_d = (e.get("hit_tokens", 0) or 0) - (s.get("hit_tokens", 0) or 0)
+            entry: Dict = {
+                "query_tokens_delta": q_d,
+                "hit_tokens_delta": h_d,
+            }
+            if q_d < 0 or h_d < 0:
+                entry["counter_reset"] = True
+            elif q_d > 0:
+                entry["token_hit_rate"] = h_d / q_d
+            out[eng] = entry
+        return out

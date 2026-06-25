@@ -642,9 +642,18 @@ class BenchmarkRunner:
         ct.add_row(["Total Token Throughput", f"{(total_in_tok + total_out_tok) / bench_time_s:.2f} tok/s" if bench_time_s > 0 else "N/A"])
         ct.add_row(["Total Compactions", str(total_comp)])
         if self._prefix_cache_delta:
+            # Always show the hit-rate row so it's not lost when only tokens print.
+            def _rate_str(rate, reset):
+                if reset:
+                    return "N/A (counter reset)"
+                if rate is not None:
+                    return f"{rate * 100:.2f}%"
+                return "0.00%"  # no queries -> nothing reused
             tok_rate = self._prefix_cache_delta.get("prefix_cache_token_hit_rate")
-            if tok_rate is not None:
-                ct.add_row(["HBM Prefix Cache Token Hit Rate", f"{tok_rate * 100:.2f}%"])
+            ct.add_row([
+                "HBM Prefix Cache Token Hit Rate",
+                _rate_str(tok_rate, self._prefix_cache_delta.get("prefix_cache_counter_reset")),
+            ])
             # Counter deltas arrive as floats from Prometheus parsing — display as ints.
             hit_tok = int(self._prefix_cache_delta.get("prefix_cache_hit_tokens_delta", 0))
             q_tok = int(self._prefix_cache_delta.get("prefix_cache_query_tokens_delta", 0))
@@ -654,8 +663,10 @@ class BenchmarkRunner:
             if evictions > 0:
                 ct.add_row(["HBM Prefix Cache Evictions", str(evictions)])
             ext_tok_rate = self._prefix_cache_delta.get("external_prefix_cache_token_hit_rate")
-            if ext_tok_rate is not None:
-                ct.add_row(["External Prefix Cache Token Hit Rate", f"{ext_tok_rate * 100:.2f}%"])
+            ct.add_row([
+                "External Prefix Cache Token Hit Rate",
+                _rate_str(ext_tok_rate, self._prefix_cache_delta.get("external_prefix_cache_counter_reset")),
+            ])
             ext_hit_tok = int(self._prefix_cache_delta.get("external_prefix_cache_hit_tokens_delta", 0))
             ext_q_tok = int(self._prefix_cache_delta.get("external_prefix_cache_query_tokens_delta", 0))
             ct.add_row(["External Prefix Cache Hit Tokens", f"{ext_hit_tok:,}"])
@@ -672,6 +683,17 @@ class BenchmarkRunner:
         print("=" * 70, flush=True)
         print("\n  Common Metrics", flush=True)
         print(ct)
+
+        # ── Per-engine prefix cache breakdown (vllm) ──
+        if self._prefix_cache_delta:
+            self._print_engine_table(
+                "HBM Prefix Cache (per engine)",
+                self._prefix_cache_delta.get("prefix_cache_engines", {}),
+            )
+            self._print_engine_table(
+                "External Prefix Cache (per engine)",
+                self._prefix_cache_delta.get("external_prefix_cache_engines", {}),
+            )
 
         # ── Performance Table (avg/min/P50/P75/P90/P99/max/N) ──
         perf = PrettyTable()
@@ -783,6 +805,38 @@ class BenchmarkRunner:
         print("\n  Per-User Summary", flush=True)
         print(ut)
         print("=" * 70, flush=True)
+
+    def _print_engine_table(self, title: str, engines: dict):
+        """Print a per-engine prefix-cache breakdown (query/hit tokens + rate).
+
+        Only shown when the backend exposes engine="N" labels; a TOTAL row
+        (summed across engines) is appended so both views are visible.
+        """
+        if not engines:
+            return
+        t = PrettyTable()
+        t.field_names = ["Engine", "Query Tokens", "Hit Tokens", "Hit Rate"]
+        t.align["Engine"] = "l"
+        t.align = "r"
+        total_q = 0
+        total_h = 0
+        for eng in sorted(engines):
+            e = engines[eng]
+            q = int(e.get("query_tokens_delta", 0))
+            h = int(e.get("hit_tokens_delta", 0))
+            total_q += q
+            total_h += h
+            rate = e.get("token_hit_rate")
+            rate_s = f"{rate * 100:.2f}%" if rate is not None else (
+                "reset" if e.get("counter_reset") else "-"
+            )
+            t.add_row([f"engine {eng}", f"{q:,}", f"{h:,}", rate_s])
+        # TOTAL row (sum across engines; rate recomputed from the sums).
+        tot_rate = (total_h / total_q) if total_q > 0 else None
+        tot_rate_s = f"{tot_rate * 100:.2f}%" if tot_rate is not None else "-"
+        t.add_row(["TOTAL", f"{total_q:,}", f"{total_h:,}", tot_rate_s])
+        print(f"\n  {title}", flush=True)
+        print(t)
 
     def _print_banner(self):
         print("=" * 70, flush=True)

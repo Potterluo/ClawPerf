@@ -5,6 +5,7 @@ from __future__ import annotations
 from clawperf.system_metrics import (
     BACKEND_MAP,
     SystemMetricsPoller,
+    extract_prefix_cache_per_engine,
     match_metrics,
     parse_prometheus_metrics,
 )
@@ -255,3 +256,49 @@ def test_vllm_metric_name_without_total_suffix():
     mapped = match_metrics(raw, BACKEND_MAP["vllm"])
     assert mapped["prefix_cache_query_tokens"] == 100
     assert mapped["prefix_cache_hit_tokens"] == 30
+
+
+def test_extract_prefix_cache_per_engine():
+    """Per-engine breakdown from real vLLM exposition (engine 0 and 1)."""
+    raw = parse_prometheus_metrics(REAL_VLLM_METRICS)
+    eng, ext_eng = extract_prefix_cache_per_engine(raw)
+    assert eng["0"]["query_tokens"] == 50000
+    assert eng["0"]["hit_tokens"] == 40000
+    assert eng["1"]["query_tokens"] == 30000
+    assert eng["1"]["hit_tokens"] == 25000
+    assert ext_eng["0"]["query_tokens"] == 8000
+    assert ext_eng["0"]["hit_tokens"] == 2000
+
+
+def test_per_engine_delta_and_rate():
+    """compute_prefix_cache_delta yields per-engine deltas + rates + total."""
+    poller = SystemMetricsPoller("http://localhost:8000/metrics", 5, "vllm")
+    start_eng = {"0": {"query_tokens": 50000, "hit_tokens": 40000},
+                 "1": {"query_tokens": 30000, "hit_tokens": 25000}}
+    end_eng = {"0": {"query_tokens": 90000, "hit_tokens": 75000},
+               "1": {"query_tokens": 30000, "hit_tokens": 25000}}  # engine 1 idle
+    start = {"prefix_cache_hit_tokens": 65000, "prefix_cache_query_tokens": 80000,
+             "prefix_cache_engines": start_eng}
+    end = {"prefix_cache_hit_tokens": 100000, "prefix_cache_query_tokens": 120000,
+           "prefix_cache_engines": end_eng}
+    delta = poller.compute_prefix_cache_delta(start, end)
+    eng = delta["prefix_cache_engines"]
+    # engine 0: +40000 queries, +35000 hits -> 87.5%
+    assert eng["0"]["query_tokens_delta"] == 40000
+    assert eng["0"]["hit_tokens_delta"] == 35000
+    assert eng["0"]["token_hit_rate"] == 35000 / 40000
+    # engine 1: no activity -> no rate key
+    assert eng["1"]["query_tokens_delta"] == 0
+    assert "token_hit_rate" not in eng["1"]
+
+
+def test_per_engine_counter_reset():
+    """A per-engine counter going backwards is flagged, not given a bogus rate."""
+    poller = SystemMetricsPoller("http://localhost:8000/metrics", 5, "vllm")
+    start = {"prefix_cache_hit_tokens": 100, "prefix_cache_query_tokens": 200,
+             "prefix_cache_engines": {"0": {"query_tokens": 200, "hit_tokens": 100}}}
+    end = {"prefix_cache_hit_tokens": 50, "prefix_cache_query_tokens": 100,
+           "prefix_cache_engines": {"0": {"query_tokens": 100, "hit_tokens": 50}}}
+    delta = poller.compute_prefix_cache_delta(start, end)
+    assert delta["prefix_cache_engines"]["0"].get("counter_reset") is True
+    assert "token_hit_rate" not in delta["prefix_cache_engines"]["0"]
