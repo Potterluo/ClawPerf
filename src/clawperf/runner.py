@@ -137,7 +137,6 @@ class BenchmarkRunner:
         _ = self.tokenizer_manager.tokenizer
 
         # 2. Initialize EvalScope components
-        from evalscope.perf.arguments import Arguments
         from evalscope.perf.core.http_client import AioHttpClient
         from evalscope.perf.plugin.api.openai_api import OpenaiPlugin
         from evalscope.perf.utils.benchmark_util import MetricsAccumulator
@@ -148,6 +147,12 @@ class BenchmarkRunner:
 
         self._api_plugin = OpenaiPlugin(es_args)
         self._http_client = AioHttpClient(es_args, self._api_plugin)
+        # evalscope's logger.py runs logging.basicConfig(force=True) at import,
+        # which overrides our earlier quieting — re-apply now that evalscope is
+        # imported and its objects constructed, so its ERROR tracebacks don't
+        # break the progress bar in non-verbose mode.
+        from clawperf.logging_setup import quiet_third_party
+        quiet_third_party(self.config.verbose)
         self._accumulator = MetricsAccumulator(
             concurrency=self.config.num_users,
             rate=-1,
@@ -183,7 +188,7 @@ class BenchmarkRunner:
             if self.config.metrics_samples:
                 await self.system_poller.start()
             self._metrics_start = await self.system_poller.snapshot()
-            logger.info("Metrics start snapshot: %s", self._metrics_start)
+            logger.info("Metrics start snapshot: %s", self._snapshot_summary(self._metrics_start))
 
         setup_time = time.monotonic() - self._setup_start_time
         logger.info("Setup complete in %.2fs — starting benchmark", setup_time)
@@ -227,7 +232,7 @@ class BenchmarkRunner:
         # Snapshot metrics after all benchmark requests
         if self.system_poller and self.config.metrics_endpoint:
             self._metrics_end = await self.system_poller.snapshot()
-            logger.info("Metrics end snapshot: %s", self._metrics_end)
+            logger.info("Metrics end snapshot: %s", self._snapshot_summary(self._metrics_end))
 
         # 8. Close progress bar
         if self._pbar:
@@ -805,6 +810,21 @@ class BenchmarkRunner:
         print("\n  Per-User Summary", flush=True)
         print(ut)
         print("=" * 70, flush=True)
+
+    @staticmethod
+    def _snapshot_summary(snap: Optional[Dict]) -> str:
+        """Concise one-line snapshot for logging (no huge per-engine dict)."""
+        if not snap:
+            return "unavailable"
+        eng = snap.get("prefix_cache_engines", {})
+        ext = snap.get("external_prefix_cache_engines", {})
+        return (
+            f"query={int(snap.get('prefix_cache_query_tokens', 0)):,} "
+            f"hit={int(snap.get('prefix_cache_hit_tokens', 0)):,} "
+            f"ext_query={int(snap.get('external_prefix_cache_query_tokens', 0)):,} "
+            f"ext_hit={int(snap.get('external_prefix_cache_hit_tokens', 0)):,} "
+            f"engines={list(eng)} ext_engines={list(ext)}"
+        )
 
     def _print_engine_table(self, title: str, engines: dict):
         """Print a per-engine prefix-cache breakdown (query/hit tokens + rate).

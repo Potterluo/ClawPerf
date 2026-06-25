@@ -12,6 +12,26 @@ import logging
 
 LOGGER_NAME = "clawperf"
 
+# Libraries whose ERROR/traceback output breaks the tqdm progress bar.
+_NOISY_LOGGERS = ("evalscope", "aiohttp", "aiohttp.access", "urllib3", "asyncio")
+
+
+def quiet_third_party(verbose: bool = False) -> None:
+    """Quiet noisy third-party loggers.
+
+    evalscope calls ``logging.basicConfig(level=INFO, force=True)`` at import
+    time (after our setup_logging), so this must be (re)applied once evalscope
+    has been imported — otherwise its ERROR tracebacks break the progress bar.
+    In verbose mode the libraries are left audible for debugging.
+    """
+    level = logging.INFO if verbose else logging.CRITICAL
+    for name in _NOISY_LOGGERS:
+        lg = logging.getLogger(name)
+        lg.setLevel(level)
+        if not verbose:
+            # Don't double-print through the root handler evalscope installed.
+            lg.propagate = False
+
 
 class TqdmLogHandler(logging.Handler):
     """Emit log records through ``tqdm.write()`` so messages never break a
@@ -52,14 +72,6 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     logger.setLevel(desired_level)
     logger.propagate = False
 
-    # Third-party libraries (evalscope, aiohttp) log ERROR tracebacks that break
-    # the tqdm progress bar. In non-verbose mode, quiet them to CRITICAL so only
-    # the live `err=N` counter and the final error distribution surface failures.
-    # Errors are still recorded per-turn (BenchmarkData.success=False). In verbose
-    # mode, leave them audible for debugging.
-    third_party = ("evalscope", "aiohttp", "aiohttp.access", "urllib3", "asyncio")
-    tp_level = logging.INFO if verbose else logging.CRITICAL
-    for name in third_party:
-        logging.getLogger(name).setLevel(tp_level)
-
+    # Apply third-party quieting (re-applied later after evalscope import).
+    quiet_third_party(verbose)
     return logger

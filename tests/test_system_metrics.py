@@ -292,6 +292,20 @@ def test_per_engine_delta_and_rate():
     assert "token_hit_rate" not in eng["1"]
 
 
+def test_extract_ignores_created_timestamp_series():
+    """prometheus_client emits a *_created{engine="N"} <epoch> series for every
+    counter. The extractor must NOT grab it (constant → delta 0 → bogus table)."""
+    raw = parse_prometheus_metrics(
+        'vllm:prefix_cache_queries_total{model_name="m",engine="0"} 50000\n'
+        'vllm:prefix_cache_queries_created{model_name="m",engine="0"} 1782374641.0006\n'
+        'vllm:prefix_cache_hits_total{model_name="m",engine="0"} 40000\n'
+        'vllm:prefix_cache_hits_created{model_name="m",engine="0"} 1782374641.0007\n'
+    )
+    eng, _ = extract_prefix_cache_per_engine(raw)
+    assert eng["0"]["query_tokens"] == 50000  # the counter, not the timestamp
+    assert eng["0"]["hit_tokens"] == 40000
+
+
 def test_per_engine_counter_reset():
     """A per-engine counter going backwards is flagged, not given a bogus rate."""
     poller = SystemMetricsPoller("http://localhost:8000/metrics", 5, "vllm")

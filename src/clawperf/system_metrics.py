@@ -100,6 +100,18 @@ def parse_prometheus_metrics(text: str) -> Dict[str, float]:
 
 _ENGINE_RE = re.compile(r'engine="(\d+)"')
 
+# Exact base names of the token counters (with and without the _total suffix).
+# We must NOT match the prometheus_client auto-generated *_created timestamp
+# series (e.g. vllm:prefix_cache_queries_created{engine="0"} <epoch>), whose
+# value is a constant creation time → delta 0 → bogus per-engine table.
+_HBM_HIT_BASES = {"vllm:prefix_cache_hits_total", "vllm:prefix_cache_hits"}
+_HBM_QUERY_BASES = {"vllm:prefix_cache_queries_total", "vllm:prefix_cache_queries"}
+_EXT_HIT_BASES = {"external_prefix_cache_hits_total", "external_prefix_cache_hits"}
+_EXT_QUERY_BASES = {
+    "external_prefix_cache_queries_total",
+    "external_prefix_cache_queries",
+}
+
 
 def extract_prefix_cache_per_engine(raw: Dict[str, float]) -> tuple[Dict, Dict]:
     """Extract per-engine prefix-cache counters from labeled raw keys.
@@ -114,19 +126,20 @@ def extract_prefix_cache_per_engine(raw: Dict[str, float]) -> tuple[Dict, Dict]:
     for key, val in raw.items():
         if "{" not in key:  # skip summed base form; only labeled series carry engine
             continue
+        base = key.split("{")[0]
+        if base.endswith("_created"):  # creation-timestamp series, not a counter
+            continue
         m = _ENGINE_RE.search(key)
         if not m:
             continue
         eng = m.group(1)
-        base = key.split("{")[0]
-        # Check external first (its name also contains "prefix_cache").
-        if "external_prefix_cache_hit" in base:
+        if base in _EXT_HIT_BASES:
             ext_engines.setdefault(eng, {})["hit_tokens"] = val
-        elif "external_prefix_cache_quer" in base:
+        elif base in _EXT_QUERY_BASES:
             ext_engines.setdefault(eng, {})["query_tokens"] = val
-        elif "prefix_cache_hit" in base:  # vllm:prefix_cache_hits(_total)
+        elif base in _HBM_HIT_BASES:
             engines.setdefault(eng, {})["hit_tokens"] = val
-        elif "prefix_cache_quer" in base:  # vllm:prefix_cache_queries(_total)
+        elif base in _HBM_QUERY_BASES:
             engines.setdefault(eng, {})["query_tokens"] = val
     return engines, ext_engines
 
