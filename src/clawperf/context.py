@@ -70,11 +70,33 @@ class UserContext:
                 )
             else:
                 old_prefix_len = self.user_prefix_tokens
+                old_prefix_content = self.user_prefix_content  # save for possible revert
                 self.history.clear()
+                # Tentatively grow the prefix (simulates retaining a summary of
+                # the cleared history). If the grown base still exceeds the limit,
+                # we revert the growth below — clearing history alone already
+                # provides relief (the base without history was under the limit,
+                # which is the precondition for entering this branch). Growing
+                # unconditionally would push the base over and permanently trap
+                # the user in overflow.
                 self.user_prefix_tokens += self.compaction_prefix_increment
                 self.user_prefix_content = tokenizer_manager.generate_random_content(
                     self.user_prefix_tokens
                 )
+                messages = self._build_messages(current_input_content)
+                context_tokens = tokenizer_manager.count_chat_tokens(messages)
+
+                if context_tokens >= self.max_context_tokens:
+                    # Growth didn't fit — revert to the old prefix size so the
+                    # next turn isn't permanently stuck in overflow.
+                    self.user_prefix_tokens = old_prefix_len
+                    self.user_prefix_content = old_prefix_content
+                    messages = self._build_messages(current_input_content)
+                    context_tokens = tokenizer_manager.count_chat_tokens(messages)
+                    grew = False
+                else:
+                    grew = True
+
                 compaction_event = CompactionEvent(
                     user_id=self.user_id,
                     turn=turn_id,
@@ -84,12 +106,13 @@ class UserContext:
                 )
                 self.compaction_events.append(compaction_event)
                 logger.info(
-                    "[User %02d] Compaction at turn %d: prefix %d → %d",
+                    "[User %02d] Compaction at turn %d: prefix %d → %d%s",
                     self.user_id, turn_id, old_prefix_len, self.user_prefix_tokens,
+                    "" if grew else " (no room to grow, history cleared only)",
                 )
-                messages = self._build_messages(current_input_content)
-                context_tokens = tokenizer_manager.count_chat_tokens(messages)
 
+                # With the revert, context should now be under the limit (base
+                # was under it). Guard anyway for tokenizer-rounding edge cases.
                 if context_tokens >= self.max_context_tokens:
                     context_overflow = True
                     logger.warning(

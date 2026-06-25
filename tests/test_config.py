@@ -50,3 +50,26 @@ class TestBenchmarkConfig:
         assert d["endpoint"] == "http://x"
         assert d["model"] == "m"
         assert "num_users" in d
+
+    def test_validate_ok_defaults(self):
+        cfg = BenchmarkConfig(endpoint="http://x", model="m")
+        assert cfg.validate() == []
+
+    def test_validate_base_exceeds_window(self):
+        cfg = BenchmarkConfig(
+            endpoint="http://x", model="m",
+            system_prefix_tokens=50000, user_prefix_tokens=50000,
+            input_tokens_per_turn=5000, max_context_tokens=100000,
+        )
+        problems = cfg.validate()
+        assert any("Base context" in p and "overflow" in p for p in problems)
+
+    def test_validate_bad_increment_and_counts(self):
+        cfg = BenchmarkConfig(
+            endpoint="http://x", model="m",
+            compaction_prefix_increment=0, num_users=0, max_turns=0,
+        )
+        problems = cfg.validate()
+        assert any("compaction_prefix_increment" in p for p in problems)
+        assert any("num_users" in p for p in problems)
+        assert any("max_turns" in p for p in problems)

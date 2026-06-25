@@ -115,3 +115,38 @@ class BenchmarkConfig:
         d.pop("arrival_mode", None)
         d.pop("arrival_param", None)
         return d
+
+    def validate(self) -> list[str]:
+        """Return a list of human-readable configuration problems (empty if OK).
+
+        Called by the runner at startup so misconfigurations surface immediately
+        instead of silently failing every turn.
+        """
+        problems: list[str] = []
+        # If the configured base token budget already meets/exceeds the window,
+        # every turn will overflow (base = system + user_prefix + input, before
+        # chat-template overhead or history).
+        base = (
+            self.system_prefix_tokens
+            + self.user_prefix_tokens
+            + self.input_tokens_per_turn
+        )
+        if base >= self.max_context_tokens:
+            problems.append(
+                f"Base context ({self.system_prefix_tokens} system + "
+                f"{self.user_prefix_tokens} user-prefix + "
+                f"{self.input_tokens_per_turn} input = {base} tokens) already "
+                f">= max_context_tokens ({self.max_context_tokens}). Every turn "
+                "will overflow — reduce prefix/input sizes or raise "
+                "--max-context-tokens."
+            )
+        if self.compaction_prefix_increment <= 0:
+            problems.append(
+                "compaction_prefix_increment must be > 0, otherwise compaction "
+                "can never provide relief."
+            )
+        if self.num_users < 1:
+            problems.append("num_users must be >= 1.")
+        if self.max_turns < 1:
+            problems.append("max_turns must be >= 1.")
+        return problems

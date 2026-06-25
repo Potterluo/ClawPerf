@@ -127,6 +127,11 @@ class BenchmarkRunner:
         self._setup_signal_handler()
         self._print_banner()
 
+        # Surface misconfigurations early (e.g. base context already exceeding
+        # the window) instead of letting every turn silently overflow.
+        for problem in self.config.validate():
+            logger.warning("CONFIG: %s", problem)
+
         # 1. Initialize tokenizer
         _ = self.tokenizer_manager.tokenizer
 

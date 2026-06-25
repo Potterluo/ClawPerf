@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
-
-from clawperf.context import UserContext, CompactionEvent
+from clawperf.context import UserContext
 
 
 def _make_tokenizer_manager(count=50000):
@@ -60,13 +58,20 @@ def test_prepare_turn_with_compaction():
     assert result["compaction_event"].new_prefix_len == 10000
 
 
-def test_prepare_turn_compaction_still_overflows():
-    """Compaction fires but context STILL exceeds limit → context_overflow=True."""
+def test_prepare_turn_compaction_reverts_when_growth_overflows():
+    """When growing the prefix would still exceed the limit, compaction reverts
+    the growth (history cleared only) so the turn SUCCEEDS instead of trapping
+    the user in permanent overflow.
+
+    Regression: the old code kept the grown prefix and marked the turn
+    context_overflow, which made every subsequent turn overflow too.
+    """
     tm = MagicMock()
-    # Call 1: initial count → over limit, enters compaction logic
-    # Call 2: base context (no history) → under 128000, so compaction CAN help
-    # Call 3: after compaction → still over 128000
-    tm.count_chat_tokens.side_effect = [200000, 50000, 150000]
+    # Call 1: with history → over limit (enters compaction)
+    # Call 2: base (no history) → under limit, so compaction CAN help
+    # Call 3: after growing prefix → still over (growth doesn't fit)
+    # Call 4: after reverting growth → under limit (turn succeeds)
+    tm.count_chat_tokens.side_effect = [200000, 50000, 150000, 50000]
     tm.generate_random_content.return_value = "generated content"
     ctx = UserContext(
         user_id=0,
@@ -80,7 +85,35 @@ def test_prepare_turn_compaction_still_overflows():
     )
     result = ctx.prepare_turn(turn_id=1, current_input_content="input", tokenizer_manager=tm)
     assert result["compaction_triggered"] is True
-    assert result["context_overflow"] is True  # still over after compaction
+    assert result["context_overflow"] is False  # reverted → fits
+    assert ctx.user_prefix_tokens == 5000  # growth reverted
+    assert result["compaction_event"].new_prefix_len == 5000  # no growth recorded
+
+
+def test_prepare_turn_compaction_no_permanent_stuck():
+    """After a compaction-that-would-overflow, the NEXT turn must not be stuck."""
+    tm = MagicMock()
+    tm.generate_random_content.return_value = "generated content"
+    ctx = UserContext(
+        user_id=0,
+        system_prefix="sys",
+        user_prefix_tokens=5000,
+        user_prefix_content="prefix",
+        input_tokens_per_turn=5000,
+        max_context_tokens=128000,
+        compaction_prefix_increment=5000,
+        max_turns=100,
+    )
+    ctx.append_history("h", "a")
+    # Turn 1: over, base under, grown still over, reverted under.
+    tm.count_chat_tokens.side_effect = [200000, 50000, 150000, 50000]
+    r1 = ctx.prepare_turn(1, "input", tm)
+    assert r1["context_overflow"] is False
+    # Turn 2: no history, prefix reverted to 5000, base under → succeeds.
+    tm.count_chat_tokens.side_effect = [50000]
+    r2 = ctx.prepare_turn(2, "input", tm)
+    assert r2["context_overflow"] is False
+    assert r2["compaction_triggered"] is False
 
 
 def test_prepare_turn_base_context_exceeds_limit():
