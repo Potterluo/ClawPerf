@@ -55,8 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── System metrics ──
     g = parser.add_argument_group("System Metrics")
-    g.add_argument("--metrics-endpoint", type=str, default=None)
-    g.add_argument("--metrics-interval", type=int, default=5)
+    g.add_argument("--metrics-endpoint", type=str, default=None,
+                   help="Prometheus /metrics URL. Only start+end snapshots are taken by default.")
+    g.add_argument("--metrics-interval", type=int, default=5,
+                   help="Polling interval (seconds) for periodic time-series; only used with --metrics-samples.")
+    g.add_argument("--metrics-samples", action="store_true", default=False,
+                   help="Collect periodic metrics samples throughout the run (extra /metrics calls). "
+                        "Off by default — only start and end snapshots are taken.")
     g.add_argument("--backend", type=str, default="vllm", choices=["vllm", "sglang", "mindie"])
 
     # ── Output ──
@@ -95,6 +100,7 @@ def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
         request_timeout=args.request_timeout,
         metrics_endpoint=args.metrics_endpoint,
         metrics_interval=args.metrics_interval,
+        metrics_samples=args.metrics_samples,
         backend=args.backend,
         output=args.output,
         history=args.history,

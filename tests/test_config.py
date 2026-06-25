@@ -79,6 +79,7 @@ class TestBenchmarkConfig:
     def test_validate_ok_defaults(self):
         cfg = BenchmarkConfig(endpoint="http://x", model="m")
         assert cfg.validate() == []
+        assert cfg.metrics_samples is False  # periodic polling is opt-in
 
     def test_validate_base_exceeds_window(self):
         cfg = BenchmarkConfig(

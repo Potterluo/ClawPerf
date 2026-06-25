@@ -51,4 +51,15 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 
     logger.setLevel(desired_level)
     logger.propagate = False
+
+    # Third-party libraries (evalscope, aiohttp) log ERROR tracebacks that break
+    # the tqdm progress bar. In non-verbose mode, quiet them to CRITICAL so only
+    # the live `err=N` counter and the final error distribution surface failures.
+    # Errors are still recorded per-turn (BenchmarkData.success=False). In verbose
+    # mode, leave them audible for debugging.
+    third_party = ("evalscope", "aiohttp", "aiohttp.access", "urllib3", "asyncio")
+    tp_level = logging.INFO if verbose else logging.CRITICAL
+    for name in third_party:
+        logging.getLogger(name).setLevel(tp_level)
+
     return logger

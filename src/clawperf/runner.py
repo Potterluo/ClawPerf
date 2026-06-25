@@ -171,14 +171,17 @@ class BenchmarkRunner:
                 max_turns=self.config.max_turns,
             )
 
-        # 5. Start system metrics poller
+        # 5. Start system metrics poller. Only start+end snapshots are taken by
+        #    default; the periodic poll loop (extra /metrics calls) runs only
+        #    when --metrics-samples is set.
         if self.config.metrics_endpoint:
             self.system_poller = SystemMetricsPoller(
                 endpoint=self.config.metrics_endpoint,
                 interval=self.config.metrics_interval,
                 backend=self.config.backend,
             )
-            await self.system_poller.start()
+            if self.config.metrics_samples:
+                await self.system_poller.start()
             self._metrics_start = await self.system_poller.snapshot()
             logger.info("Metrics start snapshot: %s", self._metrics_start)
 

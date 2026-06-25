@@ -41,6 +41,7 @@ class BenchmarkConfig:
     # ── System metrics configuration ──
     metrics_endpoint: Optional[str] = None
     metrics_interval: int = 5
+    metrics_samples: bool = False  # collect periodic time-series (else start+end only)
     backend: str = "vllm"  # "vllm", "sglang", "mindie"
 
     # ── Output configuration ──
