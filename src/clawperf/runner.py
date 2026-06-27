@@ -348,7 +348,9 @@ class BenchmarkRunner:
             from clawperf.system_metrics import reset_prefix_cache
             await reset_prefix_cache(self.config.endpoint, self.config.backend)
 
-        # 4. Start metrics snapshot.
+        # 4. Set up the metrics poller (created here so --metrics-samples covers
+        #    the whole test). The START snapshot is taken AFTER prefill below so
+        #    the prefill phase's cold queries don't dilute the measured hit rate.
         if self.config.metrics_endpoint:
             self.system_poller = SystemMetricsPoller(
                 endpoint=self.config.metrics_endpoint,
@@ -357,8 +359,6 @@ class BenchmarkRunner:
             )
             if self.config.metrics_samples:
                 await self.system_poller.start()
-            self._metrics_start = await self.system_poller.snapshot()
-            logger.info("Metrics start: %s", self._snapshot_summary(self._metrics_start))
 
         setup_time = time.monotonic() - self._setup_start_time
         logger.info("Setup complete in %.2fs — starting hit-rate test", setup_time)
@@ -369,11 +369,18 @@ class BenchmarkRunner:
             logger.info("Prefill: injecting %d distinct prefixes ...", self.config.prefix_num)
             await self._prefill_prefixes(requests)
 
-        # 6. Measure phase: fire all requests, concurrency-limited.
+        # 6. Start metrics snapshot — AFTER prefill so the delta reflects only
+        #    the measure phase (prefill's cold queries would otherwise dilute
+        #    the measured hit rate). Matches aisbench's per-stage snapshots.
+        if self.system_poller and self.config.metrics_endpoint:
+            self._metrics_start = await self.system_poller.snapshot()
+            logger.info("Metrics start (post-prefill): %s", self._snapshot_summary(self._metrics_start))
+
+        # 7. Measure phase: fire all requests, concurrency-limited.
         logger.info("Measure: sending %d requests ...", len(requests))
         self._hitrate_records = await self._measure_requests(requests)
 
-        # 7. End metrics snapshot.
+        # 8. End metrics snapshot.
         if self.system_poller and self.config.metrics_endpoint:
             self._metrics_end = await self.system_poller.snapshot()
             logger.info("Metrics end: %s", self._snapshot_summary(self._metrics_end))
