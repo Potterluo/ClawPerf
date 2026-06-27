@@ -134,6 +134,11 @@ class BenchmarkRunner:
         for problem in self.config.validate():
             logger.warning("CONFIG: %s", problem)
 
+        # Dispatch to the controlled hit-rate test mode.
+        if self.config.mode == "hitrate":
+            await self._run_hitrate()
+            return
+
         # 1. Initialize tokenizer
         _ = self.tokenizer_manager.tokenizer
 
@@ -283,6 +288,316 @@ class BenchmarkRunner:
                 f"error={bd.error}). Check --endpoint/--model/--api-key."
             )
         logger.info("Pre-flight check OK.")
+
+    async def _run_hitrate(self):
+        """Controlled prefix-cache hit-rate test: prefill prefixes, then measure.
+
+        Prompt shape per request: [shared prefix][3 boundary tokens][unique suffix].
+        The prefill phase injects each distinct prefix into the KV cache (output_len=1);
+        the measure phase fires all requests and records TTFT/TPOT/throughput. The
+        actual hit rate is read from the server's Prometheus counters (start/end delta).
+        """
+        from clawperf.hitrate import build_hitrate_requests, target_hit_rate
+
+        # 1. Initialize tokenizer + EvalScope client + metrics poller (shared infra).
+        _ = self.tokenizer_manager.tokenizer
+        from evalscope.perf.core.http_client import AioHttpClient
+        from evalscope.perf.plugin.api.openai_api import OpenaiPlugin
+        from evalscope.perf.utils.benchmark_util import MetricsAccumulator
+
+        es_args = self.config.to_evalscope_args()
+        es_args.parallel = es_args.parallel[0] if isinstance(es_args.parallel, list) else es_args.parallel
+        es_args.number = es_args.number[0] if isinstance(es_args.number, list) else es_args.number
+        es_args.max_tokens = self.config.output_len
+        es_args.parallel = self.config.concurrency
+        self._api_plugin = OpenaiPlugin(es_args)
+        self._http_client = AioHttpClient(es_args, self._api_plugin)
+        from clawperf.logging_setup import quiet_third_party
+        quiet_third_party(self.config.verbose)
+        self._accumulator = MetricsAccumulator(concurrency=self.config.concurrency, rate=-1)
+
+        await self._preflight_check()
+
+        # 2. Resolve prefix_len and build requests.
+        prefix_len = self.config.prefix_len
+        if prefix_len == 0 and self.config.hit_rate is not None:
+            prefix_len = int(self.config.input_len * self.config.hit_rate)
+        if prefix_len <= 0:
+            raise RuntimeError(
+                "hitrate: specify either --prefix-len or --hit-rate (in (0,1))."
+            )
+        requests = await asyncio.to_thread(
+            build_hitrate_requests,
+            num_requests=self.config.num_requests,
+            input_len=self.config.input_len,
+            prefix_len=prefix_len,
+            prefix_num=self.config.prefix_num,
+            tokenizer_manager=self.tokenizer_manager,
+            seed=self.config.seed,
+        )
+        target = target_hit_rate(prefix_len, self.config.input_len)
+        logger.info(
+            "Hit-rate test: %d requests, input=%d, prefix=%d (target %.1f%%), "
+            "%d distinct prefixes, output=%d, concurrency=%d",
+            len(requests), self.config.input_len, prefix_len, target * 100,
+            self.config.prefix_num, self.config.output_len, self.config.concurrency,
+        )
+
+        # 3. Optional cache reset (clean baseline).
+        if self.config.reset_cache:
+            from clawperf.system_metrics import reset_prefix_cache
+            await reset_prefix_cache(self.config.endpoint, self.config.backend)
+
+        # 4. Start metrics snapshot.
+        if self.config.metrics_endpoint:
+            self.system_poller = SystemMetricsPoller(
+                endpoint=self.config.metrics_endpoint,
+                interval=self.config.metrics_interval,
+                backend=self.config.backend,
+            )
+            if self.config.metrics_samples:
+                await self.system_poller.start()
+            self._metrics_start = await self.system_poller.snapshot()
+            logger.info("Metrics start: %s", self._snapshot_summary(self._metrics_start))
+
+        setup_time = time.monotonic() - self._setup_start_time
+        logger.info("Setup complete in %.2fs — starting hit-rate test", setup_time)
+        self._bench_start_time = time.monotonic()
+
+        # 5. Prefill phase: inject each distinct prefix (output_len=1).
+        if self.config.prefill:
+            logger.info("Prefill: injecting %d distinct prefixes ...", self.config.prefix_num)
+            await self._prefill_prefixes(requests)
+
+        # 6. Measure phase: fire all requests, concurrency-limited.
+        logger.info("Measure: sending %d requests ...", len(requests))
+        self._hitrate_records = await self._measure_requests(requests)
+
+        # 7. End metrics snapshot.
+        if self.system_poller and self.config.metrics_endpoint:
+            self._metrics_end = await self.system_poller.snapshot()
+            logger.info("Metrics end: %s", self._snapshot_summary(self._metrics_end))
+
+        # 8. Compute prefix-cache delta (reuses the scenario-mode logic).
+        if self.system_poller:
+            self._prefix_cache_delta = self.system_poller.compute_prefix_cache_delta(
+                self._metrics_start, self._metrics_end
+            )
+
+        bench_time_s = time.monotonic() - self._bench_start_time
+        # 9. Cleanup & save (hitrate-specific finalize).
+        await self._finalize_hitrate(prefix_len, target, bench_time_s, setup_time)
+
+    async def _prefill_prefixes(self, requests):
+        """Send each distinct prefix once with output_len=1 to inject into cache."""
+        seen = set()
+        prefill_msgs = []
+        for r in requests:
+            if r.prefix_idx in seen:
+                continue
+            seen.add(r.prefix_idx)
+            prefill_msgs.append(r.prefill_prompt)
+        sem = asyncio.Semaphore(self.config.concurrency)
+
+        async def _one(prompt: str):
+            async with sem:
+                body = self._api_plugin.build_request(
+                    [{"role": "user", "content": prompt}]
+                )
+                if body is None:
+                    return
+                # short output just to force prefill of the prompt into KV cache
+                body = dict(body)
+                body["max_tokens"] = 1
+                try:
+                    await self._http_client.post(body)
+                except Exception as e:
+                    logger.warning("Prefill request failed: %s", e)
+
+        await asyncio.gather(*[_one(p) for p in prefill_msgs])
+
+    async def _measure_requests(self, requests) -> List[Dict]:
+        """Fire all measure-phase requests (concurrency-limited) and record metrics."""
+        sem = asyncio.Semaphore(self.config.concurrency)
+        records: List[Dict] = []
+
+        if not self.config.verbose:
+            self._pbar = tqdm(
+                total=len(requests), desc="HitRate", unit="req",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            )
+
+        async def _one(r):
+            async with sem:
+                wall_start = time.monotonic()
+                body = self._api_plugin.build_request(
+                    [{"role": "user", "content": r.measure_prompt}]
+                )
+                if body is None:
+                    rec = {"index": r.index, "success": False, "error_type": "build_request_failed"}
+                else:
+                    bd = await self._http_client.post(body)
+                    wall_end = time.monotonic()
+                    rec = self._build_hitrate_record(r, bd, wall_start, wall_end)
+                records.append(rec)
+                self._advance_progress(rec)
+
+        await asyncio.gather(*[_one(r) for r in requests])
+        if self._pbar:
+            self._pbar.close()
+        return records
+
+    def _build_hitrate_record(self, req, bd, wall_start, wall_end) -> dict:
+        rec = {
+            "index": req.index,
+            "prefix_idx": req.prefix_idx,
+            "success": bd.success,
+            "input_tokens": req.total_len,
+            "prefix_len": req.prefix_len,
+            "wall_start_ts": round(wall_start - self._bench_start_time, 3),
+            "wall_end_ts": round(wall_end - self._bench_start_time, 3),
+        }
+        if bd.success:
+            rec["ttft_ms"] = bd.first_chunk_latency * 1000 if bd.first_chunk_latency is not None else None
+            rec["e2e_latency_ms"] = bd.query_latency * 1000 if bd.query_latency is not None else None
+            rec["tpot_ms"] = bd.time_per_output_token * 1000 if bd.time_per_output_token is not None else None
+            rec["output_tokens"] = bd.completion_tokens
+        else:
+            rec["error"] = bd.error
+            rec["error_type"] = classify_error(bd)
+            rec["status_code"] = bd.status_code
+        return rec
+
+    async def _finalize_hitrate(self, prefix_len: int, target: float, bench_time_s: float, setup_time_s: float):
+        """Save results + print the hit-rate summary (measured vs target)."""
+        if self.system_poller:
+            await self.system_poller.stop()
+        if self._http_client:
+            await self._http_client.client.close()
+
+        success = [r for r in self._hitrate_records if r.get("success")]
+        errors = [r for r in self._hitrate_records if not r.get("success")]
+        total_out = sum(r.get("output_tokens", 0) or 0 for r in success)
+        total_in = sum(r.get("input_tokens", 0) or 0 for r in success)
+
+        measured = None
+        if self._prefix_cache_delta:
+            measured = self._prefix_cache_delta.get("prefix_cache_token_hit_rate")
+
+        summary = {
+            "mode": "hitrate",
+            "num_requests": len(self._hitrate_records),
+            "success_count": len(success),
+            "error_count": len(errors),
+            "input_len": self.config.input_len,
+            "prefix_len": prefix_len,
+            "target_hit_rate": target,
+            "measured_hit_rate": measured,
+            "total_input_tokens": total_in,
+            "total_output_tokens": total_out,
+            "bench_time_s": round(bench_time_s, 3),
+        }
+        # percentiles
+        for key, src in (("ttft", "ttft_ms"), ("e2e_latency", "e2e_latency_ms"), ("tpot", "tpot_ms")):
+            vals = [r[src] for r in success if r.get(src) is not None]
+            if vals:
+                summary[key] = _percentiles(vals)
+        if self._prefix_cache_delta:
+            summary["prefix_cache"] = self._prefix_cache_delta
+
+        result = {
+            "config": self.config.to_dict(),
+            "summary": summary,
+            "requests": self._hitrate_records,
+            "timing": {"setup_time_s": round(setup_time_s, 3), "bench_time_s": round(bench_time_s, 3)},
+        }
+        if self.system_poller:
+            result["system_metrics"] = self.system_poller.get_samples()
+
+        import os
+        out_dir = os.path.dirname(self.config.output)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        with open(self.config.output, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False, default=str)
+
+        self._append_history(result, setup_time_s, bench_time_s)
+        self._print_hitrate_summary(summary, bench_time_s, setup_time_s, target, measured)
+        logger.info("Results saved to: %s", self.config.output)
+
+    def _print_hitrate_summary(self, summary, bench_time_s, setup_time_s, target, measured):
+        success = [r for r in self._hitrate_records if r.get("success")]
+        total_out = sum(r.get("output_tokens", 0) or 0 for r in success)
+        total_in = sum(r.get("input_tokens", 0) or 0 for r in success)
+
+        print("\n" + "=" * 70, flush=True)
+        print("ClawPerf - Hit-Rate Test Complete", flush=True)
+        print("=" * 70, flush=True)
+
+        ct = PrettyTable()
+        ct.field_names = ["Metric", "Value"]
+        ct.align["Metric"] = "l"
+        ct.align["Value"] = "r"
+        ct.add_row(["Setup Time", f"{setup_time_s:.2f} s"])
+        ct.add_row(["Duration", f"{bench_time_s:.2f} s"])
+        ct.add_row(["Total Requests", str(len(self._hitrate_records))])
+        ct.add_row(["Success Requests", str(len(success))])
+        ct.add_row(["Failed Requests", str(len([r for r in self._hitrate_records if not r.get("success")]))])
+        ct.add_row(["Input Length", f"{self.config.input_len} tokens"])
+        ct.add_row(["Prefix Length", f"{summary['prefix_len']} tokens"])
+        ct.add_row(["Distinct Prefixes", str(self.config.prefix_num)])
+        ct.add_row(["Output Length", f"{self.config.output_len} tokens"])
+        ct.add_row(["Concurrency", str(self.config.concurrency)])
+        ct.add_row(["Total Input Tokens", f"{total_in:,}"])
+        ct.add_row(["Total Output Tokens", f"{total_out:,}"])
+        ct.add_row(["Output Token Throughput", f"{total_out / bench_time_s:.2f} tok/s" if bench_time_s > 0 else "N/A"])
+        # The headline: target vs measured hit rate.
+        ct.add_row(["TARGET Hit Rate", f"{target * 100:.2f}%"])
+        if measured is not None:
+            ct.add_row(["MEASURED Hit Rate", f"{measured * 100:.2f}%"])
+        elif self._prefix_cache_delta and self._prefix_cache_delta.get("prefix_cache_counter_reset"):
+            ct.add_row(["MEASURED Hit Rate", "N/A (counter reset)"])
+        else:
+            ct.add_row(["MEASURED Hit Rate", "N/A (no metrics endpoint)"])
+        if self._prefix_cache_delta:
+            hit_tok = int(self._prefix_cache_delta.get("prefix_cache_hit_tokens_delta", 0))
+            q_tok = int(self._prefix_cache_delta.get("prefix_cache_query_tokens_delta", 0))
+            ct.add_row(["HBM Hit Tokens", f"{hit_tok:,}"])
+            ct.add_row(["HBM Query Tokens", f"{q_tok:,}"])
+        print("\n  Hit-Rate Results", flush=True)
+        print(ct)
+
+        # per-engine table (reuses scenario helper)
+        if self._prefix_cache_delta:
+            self._print_engine_table(
+                "HBM Prefix Cache (per engine)",
+                self._prefix_cache_delta.get("prefix_cache_engines", {}),
+            )
+
+        # performance percentiles
+        perf = PrettyTable()
+        perf.field_names = ["Metric", "Avg", "Min", "P25", "P50", "P75", "P90", "P99", "Max", "N"]
+        perf.align["Metric"] = "l"
+        perf.align = "r"
+        for name, src in (("TTFT", "ttft_ms"), ("E2E Latency", "e2e_latency_ms"), ("TPOT", "tpot_ms")):
+            vals = [r[src] for r in success if r.get(src) is not None]
+            pct = _percentiles(vals)
+            if pct:
+                row = [name]
+                for key in ("avg", "min", "P25", "P50", "P75", "P90", "P99", "max", "N"):
+                    v = pct.get(key)
+                    if key == "N":
+                        row.append(str(int(v)))
+                    elif v is not None:
+                        row.append(_fmt_val(v, "ms", 2))
+                    else:
+                        row.append("N/A")
+                perf.add_row(row)
+            else:
+                perf.add_row([name] + ["N/A"] * 9)
+        print("\n  Performance Results", flush=True)
+        print(perf)
+        print("=" * 70, flush=True)
 
     async def _generate_content(self):
         """Generate system/user-prefix/turn-input content off the event loop."""

@@ -180,12 +180,27 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN)
 
 
+BLOCK_CHARS = 64  # ~16 tokens at 4 chars/token, matching vLLM's default block_size
+
+
 def _messages_to_chunks(messages: list) -> list[tuple[str, int]]:
-    """Convert a messages list into trie chunks: (content_hash, estimated_tokens)."""
+    """Convert a messages list into trie chunks: (block_hash, estimated_tokens).
+
+    Each message's text is split into BLOCK_CHARS-sized sub-chunks so that a
+    measure request sharing only a leading prefix with a prefill request still
+    partially matches (mimics vLLM's block-level KV cache, not message-level).
+    Small messages (< one block) collapse to a single chunk, preserving prior
+    behavior for short test fixtures.
+    """
     chunks = []
     for m in messages:
         text = _content_to_text(m.get("content", ""))
-        chunks.append((hash(text), _estimate_tokens(text)))
+        if not text:
+            chunks.append((hash(""), 1))
+            continue
+        for i in range(0, len(text), BLOCK_CHARS):
+            block = text[i : i + BLOCK_CHARS]
+            chunks.append((hash(block), _estimate_tokens(block)))
     return chunks
 
 

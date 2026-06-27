@@ -14,6 +14,22 @@ from typing import Optional
 class BenchmarkConfig:
     """All configurable parameters for a benchmark run."""
 
+    # ── Mode ──
+    # "scenario" = multi-turn long-context workload (default).
+    # "hitrate"  = controlled prefix-cache hit-rate test (prefill + measure).
+    mode: str = "scenario"
+
+    # ── Hit-rate mode configuration (ignored in scenario mode) ──
+    num_requests: int = 100        # total measure-phase requests
+    input_len: int = 1024          # total prompt length (prefix + boundary + suffix)
+    output_len: int = 128          # generation length per request
+    prefix_len: int = 0            # shared-prefix length (0 = derive from hit_rate)
+    hit_rate: Optional[float] = None  # target fraction that's shared (0..1); derives prefix_len
+    prefix_num: int = 1            # number of DISTINCT prefixes (requests-per-prefix = N//prefix_num)
+    prefill: bool = True           # inject prefixes into cache before measuring
+    concurrency: int = 1           # in-flight requests during measure phase
+    seed: int = 0                  # reproducibility seed for prompt construction
+
     # ── User configuration ──
     num_users: int = 1
     user_arrival: str = "burst"  # "burst", "steady:<interval>", "poisson:<lambda>"
@@ -179,4 +195,36 @@ class BenchmarkConfig:
             problems.append("num_users must be >= 1.")
         if self.max_turns < 1:
             problems.append("max_turns must be >= 1.")
+
+        # Hit-rate mode validation (only applies in that mode).
+        if self.mode == "hitrate":
+            from clawperf.hitrate import BOUNDARY_TOKENS
+
+            if self.num_requests < 1:
+                problems.append("hitrate: num_requests must be >= 1.")
+            if self.input_len < 1:
+                problems.append("hitrate: input_len must be >= 1.")
+            if self.output_len < 1:
+                problems.append("hitrate: output_len must be >= 1.")
+            if self.prefix_num < 1:
+                problems.append("hitrate: prefix_num must be >= 1.")
+            if self.prefix_num > self.num_requests:
+                problems.append(
+                    f"hitrate: prefix_num ({self.prefix_num}) must be <= "
+                    f"num_requests ({self.num_requests})."
+                )
+            if self.hit_rate is not None and not (0.0 < self.hit_rate < 1.0):
+                problems.append("hitrate: hit_rate must be in (0, 1).")
+            # Resolve prefix_len for the boundary check.
+            plen = self.prefix_len
+            if plen == 0 and self.hit_rate is not None:
+                plen = int(self.input_len * self.hit_rate)
+            if plen > 0 and self.input_len - plen - BOUNDARY_TOKENS < 1:
+                problems.append(
+                    f"hitrate: input_len ({self.input_len}) too small for "
+                    f"prefix_len ({plen}) + boundary ({BOUNDARY_TOKENS}); "
+                    "need room for a unique suffix."
+                )
+        elif self.mode not in ("scenario",):
+            problems.append(f"unknown mode {self.mode!r} (expected 'scenario' or 'hitrate').")
         return problems

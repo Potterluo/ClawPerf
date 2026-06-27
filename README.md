@@ -85,6 +85,40 @@ clawperf \
   --verbose
 ```
 
+### Hit-rate test mode (controlled prefix-cache hit rate)
+
+Instead of a multi-turn scenario, run a controlled prefix-cache hit-rate test:
+specify input/output length and a target hit rate, and ClawPerf constructs
+prompts with a known shared-prefix / unique-suffix split, prefills the prefixes,
+then measures the **actual** hit rate from the server's Prometheus counters.
+
+```bash
+clawperf --mode hitrate \
+  --endpoint http://localhost:8000/v1/chat/completions \
+  --model qwen3-32b --tokenizer qwen3-32b \
+  --num-requests 100 --input-len 1024 --output-len 128 \
+  --hit-rate 0.5 \        # target 50% (or --prefix-len 512)
+  --prefix-num 10 \       # 10 distinct prefixes -> 10 requests reuse each
+  --concurrency 20 \
+  --metrics-endpoint http://localhost:8000/metrics --backend vllm \
+  --reset-cache
+```
+
+How it works (borrowed from aisbench / vLLM `prefix_repetition`):
+- Each request = `[shared prefix] + [3 boundary tokens] + [unique suffix]`. The
+  boundary tokens force the cache to stop at exactly `prefix_len`, so the hit is
+  precisely the shared portion.
+- `--prefix-num` distinct prefixes are assigned round-robin and **shuffled** so
+  reuse happens under concurrency (not back-to-back duplicates).
+- `--prefill` (default on) injects each distinct prefix with `output_len=1`
+  before measuring, so even the first request per prefix hits.
+- The summary prints **TARGET vs MEASURED** hit rate (measured from
+  `vllm:prefix_cache_hits_total`/`queries_total` deltas), per-engine breakdown,
+  and TTFT/TPOT percentiles.
+
+`--hit-rate` (fraction) and `--prefix-len` (absolute) are mutually exclusive;
+one derives the other from `--input-len`.
+
 ## CLI Options
 
 ### User Configuration

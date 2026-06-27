@@ -21,6 +21,39 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    # ── Mode ──
+    g = parser.add_argument_group("Mode")
+    g.add_argument("--mode", type=str, default="scenario",
+                   choices=["scenario", "hitrate"],
+                   help="'scenario' (default): multi-turn long-context workload. "
+                        "'hitrate': controlled prefix-cache hit-rate test "
+                        "(prefill + measure, reports actual vs target hit rate).")
+
+    # ── Hit-rate mode configuration ──
+    g = parser.add_argument_group("Hit-Rate Mode (only with --mode hitrate)")
+    g.add_argument("--num-requests", type=int, default=100,
+                   help="Total measure-phase requests.")
+    g.add_argument("--input-len", type=int, default=1024,
+                   help="Total prompt length (prefix + boundary + suffix), in tokens.")
+    g.add_argument("--output-len", type=int, default=128,
+                   help="Generation length per request.")
+    g.add_argument("--prefix-len", type=int, default=0,
+                   help="Shared-prefix length in tokens. 0 = derive from --hit-rate.")
+    g.add_argument("--hit-rate", type=float, default=None,
+                   help="Target hit rate as a fraction in (0,1); derives prefix_len "
+                        "= hit_rate * input_len. Mutually exclusive with --prefix-len.")
+    g.add_argument("--prefix-num", type=int, default=1,
+                   help="Number of DISTINCT prefixes. requests-per-prefix = "
+                        "num_requests // prefix_num. 1 = all share one prefix.")
+    g.add_argument("--prefill", action="store_true", default=True,
+                   help="Inject prefixes into the cache before measuring (default on).")
+    g.add_argument("--no-prefill", action="store_false", dest="prefill",
+                   help="Skip the prefill phase (measure cold + natural reuse only).")
+    g.add_argument("--concurrency", type=int, default=1,
+                   help="In-flight requests during the measure phase.")
+    g.add_argument("--seed", type=int, default=0,
+                   help="Reproducibility seed for prompt construction.")
+
     # ── User configuration ──
     g = parser.add_argument_group("User Configuration")
     g.add_argument("--num-users", type=int, default=1, help="Total concurrent users.")
@@ -85,7 +118,20 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Validate prefix-len / hit-rate mutual exclusivity (argparse can't easily).
+    if getattr(args, "prefix_len", 0) and getattr(args, "hit_rate", None) is not None:
+        parser.error("--prefix-len and --hit-rate are mutually exclusive; specify one.")
     return BenchmarkConfig(
+        mode=args.mode,
+        num_requests=args.num_requests,
+        input_len=args.input_len,
+        output_len=args.output_len,
+        prefix_len=args.prefix_len,
+        hit_rate=args.hit_rate,
+        prefix_num=args.prefix_num,
+        prefill=args.prefill,
+        concurrency=args.concurrency,
+        seed=args.seed,
         num_users=args.num_users,
         user_arrival=args.user_arrival,
         system_prefix_tokens=args.system_prefix_tokens,
