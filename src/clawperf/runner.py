@@ -69,6 +69,7 @@ def _percentiles(values: list[float]) -> dict:
     return {
         "avg": statistics.mean(s),
         "min": s[0],
+        "P25": _percentile(values, 0.25),
         "P50": _percentile(values, 0.50),
         "P75": _percentile(values, 0.75),
         "P90": _percentile(values, 0.90),
@@ -158,6 +159,11 @@ class BenchmarkRunner:
             rate=-1,
         )
 
+        # Pre-flight health check: send one tiny request and fail fast if the
+        # endpoint is unreachable/wrong — avoids burning minutes of content
+        # generation only to produce an all-error run. (Borrowed from llmperf.)
+        await self._preflight_check()
+
         # 3. Generate content (off the event loop so it stays responsive;
         #    logging is now configured so each phase prints a live status line).
         await self._generate_content()
@@ -189,6 +195,14 @@ class BenchmarkRunner:
                 await self.system_poller.start()
             self._metrics_start = await self.system_poller.snapshot()
             logger.info("Metrics start snapshot: %s", self._snapshot_summary(self._metrics_start))
+
+        # Optionally evict the server's prefix cache so the measured hit rate
+        # reflects only this benchmark's prefixes (not residual traffic). Done
+        # AFTER the start snapshot so counters are unaffected (reset evicts KV
+        # blocks, not cumulative counters); the delta still isolates our run.
+        if self.config.reset_cache:
+            from clawperf.system_metrics import reset_prefix_cache
+            await reset_prefix_cache(self.config.endpoint, self.config.backend)
 
         setup_time = time.monotonic() - self._setup_start_time
         logger.info("Setup complete in %.2fs — starting benchmark", setup_time)
@@ -240,6 +254,35 @@ class BenchmarkRunner:
 
         # 9. Cleanup & save
         await self._finalize()
+
+    async def _preflight_check(self):
+        """Send one minimal request to confirm the endpoint is reachable and
+        the model responds. Aborts early (RuntimeError) on failure so the user
+        doesn't wait through content generation + a full all-error run."""
+        logger.info("Pre-flight check: probing %s ...", self.config.endpoint)
+        messages = [{"role": "user", "content": "hi"}]
+        try:
+            request_body = self._api_plugin.build_request(messages)
+        except Exception as e:
+            raise RuntimeError(f"Pre-flight: failed to build request: {e}") from e
+        if request_body is None:
+            raise RuntimeError("Pre-flight: build_request returned None — check --endpoint/--model.")
+        try:
+            bd = await asyncio.wait_for(
+                self._http_client.post(request_body), timeout=min(30, self.config.request_timeout)
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"Pre-flight: request to {self.config.endpoint} timed out — is the server up?"
+            )
+        except Exception as e:
+            raise RuntimeError(f"Pre-flight: request to {self.config.endpoint} failed: {e}") from e
+        if not bd.success:
+            raise RuntimeError(
+                f"Pre-flight: server rejected the probe (status={bd.status_code}, "
+                f"error={bd.error}). Check --endpoint/--model/--api-key."
+            )
+        logger.info("Pre-flight check OK.")
 
     async def _generate_content(self):
         """Generate system/user-prefix/turn-input content off the event loop."""
@@ -644,6 +687,19 @@ class BenchmarkRunner:
         ct.add_row(["Total Output Tokens", f"{total_out_tok:,}"])
         ct.add_row(["Request Throughput", f"{len(success_turns) / bench_time_s:.4f} req/s" if bench_time_s > 0 else "N/A"])
         ct.add_row(["Output Token Throughput", f"{total_out_tok / bench_time_s:.2f} tok/s" if bench_time_s > 0 else "N/A"])
+        # Decode-only throughput: total output tokens / sum of per-request decode
+        # times (e2e - ttft). Isolates generation speed from prefill/TTFT.
+        # (Borrowed from llmperf's incremental_throughput.)
+        decode_time_s = sum(
+            (t.get("e2e_latency_ms", 0) - t.get("ttft_ms", 0)) / 1000
+            for t in success_turns
+            if t.get("e2e_latency_ms") and t.get("ttft_ms")
+            and t["e2e_latency_ms"] > t["ttft_ms"]
+        )
+        ct.add_row([
+            "Decode Throughput (excl prefill)",
+            f"{total_out_tok / decode_time_s:.2f} tok/s" if decode_time_s > 0 else "N/A",
+        ])
         ct.add_row(["Total Token Throughput", f"{(total_in_tok + total_out_tok) / bench_time_s:.2f} tok/s" if bench_time_s > 0 else "N/A"])
         ct.add_row(["Total Compactions", str(total_comp)])
         if self._prefix_cache_delta:
@@ -700,9 +756,9 @@ class BenchmarkRunner:
                 self._prefix_cache_delta.get("external_prefix_cache_engines", {}),
             )
 
-        # ── Performance Table (avg/min/P50/P75/P90/P99/max/N) ──
+        # ── Performance Table (avg/min/P25/P50/P75/P90/P99/max/N) ──
         perf = PrettyTable()
-        perf.field_names = ["Metric", "Avg", "Min", "P50", "P75", "P90", "P99", "Max", "N"]
+        perf.field_names = ["Metric", "Avg", "Min", "P25", "P50", "P75", "P90", "P99", "Max", "N"]
         perf.align["Metric"] = "l"
         perf.align = "r"  # default right for numbers
 
@@ -723,7 +779,7 @@ class BenchmarkRunner:
         ]:
             if pct:
                 row = [name]
-                for key in ("avg", "min", "P50", "P75", "P90", "P99", "max", "N"):
+                for key in ("avg", "min", "P25", "P50", "P75", "P90", "P99", "max", "N"):
                     v = pct.get(key)
                     if key == "N":
                         row.append(str(int(v)))
@@ -733,7 +789,7 @@ class BenchmarkRunner:
                         row.append("N/A")
                 perf.add_row(row)
             else:
-                perf.add_row([name] + ["N/A"] * 8)
+                perf.add_row([name] + ["N/A"] * 9)
 
         print("\n  Performance Results", flush=True)
         print(perf)

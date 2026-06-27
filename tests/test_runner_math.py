@@ -32,7 +32,7 @@ def test_percentile_known_quantiles():
 
 def test_percentiles_dict_keys():
     pct = _percentiles([1.0, 2.0, 3.0, 4.0])
-    assert set(pct) == {"avg", "min", "P50", "P75", "P90", "P99", "max", "N"}
+    assert set(pct) == {"avg", "min", "P25", "P50", "P75", "P90", "P99", "max", "N"}
     assert pct["N"] == 4
     assert pct["min"] == 1.0
     assert pct["max"] == 4.0

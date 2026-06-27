@@ -62,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--metrics-samples", action="store_true", default=False,
                    help="Collect periodic metrics samples throughout the run (extra /metrics calls). "
                         "Off by default — only start and end snapshots are taken.")
+    g.add_argument("--reset-cache", action="store_true", default=False,
+                   help="Evict the server's prefix cache before the start snapshot (POST "
+                        "/reset_prefix_cache for vLLM, /flush_cache for SGLang) so the measured "
+                        "hit rate reflects only this benchmark's prefixes.")
     g.add_argument("--backend", type=str, default="vllm", choices=["vllm", "sglang", "mindie"])
 
     # ── Output ──
@@ -101,6 +105,7 @@ def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
         metrics_endpoint=args.metrics_endpoint,
         metrics_interval=args.metrics_interval,
         metrics_samples=args.metrics_samples,
+        reset_cache=args.reset_cache,
         backend=args.backend,
         output=args.output,
         history=args.history,
@@ -128,3 +133,7 @@ def main():
             asyncio.run(runner.shutdown_and_save())
         except Exception as e:
             print(f"[ClawPerf] Failed to save partial results: {e}", file=sys.stderr)
+    except RuntimeError as e:
+        # Pre-flight / hard config errors: print a clean message, not a traceback.
+        print(f"\n[ClawPerf] {e}", file=sys.stderr)
+        sys.exit(1)

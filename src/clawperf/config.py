@@ -42,6 +42,7 @@ class BenchmarkConfig:
     metrics_endpoint: Optional[str] = None
     metrics_interval: int = 5
     metrics_samples: bool = False  # collect periodic time-series (else start+end only)
+    reset_cache: bool = False  # evict prefix cache before start snapshot (clean baseline)
     backend: str = "vllm"  # "vllm", "sglang", "mindie"
 
     # ── Output configuration ──

@@ -127,9 +127,13 @@ clawperf \
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--metrics-endpoint` | None | Prometheus metrics URL |
-| `--metrics-interval` | 5 | Polling interval in seconds |
+| `--metrics-endpoint` | None | Prometheus metrics URL. Only start+end snapshots are taken. |
+| `--metrics-interval` | 5 | Polling interval (s) for periodic time-series; only with `--metrics-samples` |
+| `--metrics-samples` | False | Collect periodic metrics throughout the run (extra `/metrics` calls) |
+| `--reset-cache` | False | Evict the server's prefix cache before the start snapshot (`/reset_prefix_cache` for vLLM, `/flush_cache` for SGLang) so the measured hit rate reflects only this benchmark |
 | `--backend` | vllm | Backend: `vllm`, `sglang`, or `mindie` |
+
+> A pre-flight health check (one tiny request) runs before content generation and aborts early if the endpoint is unreachable, so you don't burn minutes producing an all-error run.
 
 ### Output
 

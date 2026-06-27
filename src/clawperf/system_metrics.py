@@ -339,3 +339,52 @@ class SystemMetricsPoller:
                 entry["token_hit_rate"] = h_d / q_d
             out[eng] = entry
         return out
+
+
+# Backend-specific prefix-cache reset endpoints (evict resident KV blocks so the
+# measured hit rate reflects only this benchmark's prefixes, not residual traffic).
+# Borrowed from llmperf-hitrate / kv-cache-tester. Note: these evict KV *blocks*,
+# they do NOT reset the cumulative counters — so start/end deltas still work.
+RESET_PATHS = {
+    "vllm": "/reset_prefix_cache",
+    "sglang": "/flush_cache",
+    "mindie": None,  # no known reset endpoint
+}
+
+
+def _base_url(endpoint: str) -> str:
+    """Strip /v1/... from an OpenAI endpoint to get the server base URL."""
+    for suf in ("/v1/chat/completions", "/v1/completions", "/v1"):
+        if endpoint.rstrip("/").endswith(suf):
+            return endpoint.rstrip("/")[: -len(suf)]
+    return endpoint.rstrip("/").rstrip("/v1")
+
+
+async def reset_prefix_cache(endpoint: str, backend: str) -> bool:
+    """POST to the backend's cache-reset endpoint. Returns True on success.
+
+    Non-fatal: warns and returns False if the endpoint is missing or errors
+    (the benchmark proceeds; only the cache-baseline cleanliness is lost).
+    """
+    path = RESET_PATHS.get(backend)
+    if path is None:
+        logger.info("No prefix-cache reset endpoint known for backend %r; skipping.", backend)
+        return False
+    base = _base_url(endpoint)
+    url = base + path
+    try:
+        import aiohttp
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as session:
+            async with session.post(url) as resp:
+                if resp.status == 200:
+                    logger.info("Prefix cache reset OK (%s)", url)
+                    return True
+                body = await resp.text()
+                logger.warning("Prefix cache reset %s returned %d: %s", url, resp.status, body[:200])
+                return False
+    except Exception as e:
+        logger.warning("Prefix cache reset %s failed: %s", url, e)
+        return False
