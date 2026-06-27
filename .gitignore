@@ -62,3 +62,6 @@ docs/superpowers/
 
 # Large images (use compressed jpg in docs instead)
 docs/*.png
+# Local model caches / tool markers
+models/
+*.mdl
