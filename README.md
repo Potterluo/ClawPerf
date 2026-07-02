@@ -119,6 +119,38 @@ How it works (borrowed from aisbench / vLLM `prefix_repetition`):
 `--hit-rate` (fraction) and `--prefix-len` (absolute) are mutually exclusive;
 one derives the other from `--input-len`.
 
+### SLO capacity sweep mode (find max concurrent users)
+
+Specify TTFT/TPOT SLO targets; ClawPerf sweeps concurrency (closed-loop, each
+user sends back-to-back multi-turn requests) and finds the **max users** the
+system can sustain while meeting the SLO. Reuses the scenario workload
+(system/user prefix, input/output per turn, max_context, compaction).
+
+```bash
+clawperf --mode slo \
+  --endpoint http://localhost:8000/v1/chat/completions \
+  --model qwen3-32b --tokenizer qwen3-32b \
+  --slo-ttft-ms 500 --slo-tpot-ms 30 \   # P99 must be ≤ these
+  --slo-percentile 0.99 \                 # P99 (or 0.95/0.90)
+  --slo-min-users 1 --slo-max-users 200 \
+  --slo-step-strategy geometric \         # double each step (or linear)
+  --slo-step-turns 5 --slo-step-warmup-turns 1 \
+  --system-prefix-tokens 15000 --input-tokens-per-turn 5000 \
+  --output-tokens-per-turn 1000 --max-context-tokens 128000 \
+  --backend vllm --reset-cache
+```
+
+How it works:
+- **Geometric ramp** (1→2→4→8→…) finds the knee region fast; at each N it runs
+  `warmup + measure` turns per user and checks P{slo_percentile} TTFT/TPOT.
+- **Binary refine** between the last-good and first-bad N pinpoints the exact max.
+- Optional `--slo-error-rate` caps the error rate; `--slo-step-timeout-s` aborts
+  a step if the server is overloaded.
+- `--slo-step-reset-cache` (default on) isolates each step; turn it off to test
+  sustained pressure.
+- Output: a **capacity curve** (N vs P99 TTFT/TPOT/error/SLO-met) and the
+  `Max sustained users` verdict.
+
 ## CLI Options
 
 ### User Configuration

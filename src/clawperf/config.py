@@ -17,9 +17,10 @@ class BenchmarkConfig:
     # ── Mode ──
     # "scenario" = multi-turn long-context workload (default).
     # "hitrate"  = controlled prefix-cache hit-rate test (prefill + measure).
+    # "slo"      = SLO-driven max-concurrency sweep (find max users meeting TTFT/TPOT).
     mode: str = "scenario"
 
-    # ── Hit-rate mode configuration (ignored in scenario mode) ──
+    # ── Hit-rate mode configuration (ignored in other modes) ──
     num_requests: int = 100        # total measure-phase requests
     input_len: int = 1024          # total prompt length (prefix + boundary + suffix)
     output_len: int = 128          # generation length per request
@@ -29,6 +30,22 @@ class BenchmarkConfig:
     prefill: bool = True           # inject prefixes into cache before measuring
     concurrency: int = 1           # in-flight requests during measure phase
     seed: int = 0                  # reproducibility seed for prompt construction
+
+    # ── SLO mode configuration (only with --mode slo) ──
+    # Sweep concurrency N; find the max N where P{slo_percentile} TTFT/TPOT
+    # stay under the SLO targets. Reuses the scenario workload (system/user
+    # prefix, input/output per turn, max_context, compaction).
+    slo_ttft_ms: Optional[float] = None   # P{slo_percentile} TTFT must be <= this
+    slo_tpot_ms: Optional[float] = None   # P{slo_percentile} TPOT must be <= this
+    slo_percentile: float = 0.99          # 0.90 / 0.95 / 0.99
+    slo_error_rate: Optional[float] = None  # max allowed error rate (None = unchecked)
+    slo_min_users: int = 1
+    slo_max_users: int = 100
+    slo_step_strategy: str = "geometric"  # "geometric" (double) or "linear"
+    slo_step_turns: int = 5               # measured turns per user per step
+    slo_step_warmup_turns: int = 1        # warmup turns (excluded from stats)
+    slo_step_timeout_s: int = 300         # per-step timeout (abort on overload)
+    slo_step_reset_cache: bool = True     # reset cache between steps (reproducible)
 
     # ── User configuration ──
     num_users: int = 1
@@ -225,6 +242,15 @@ class BenchmarkConfig:
                     f"prefix_len ({plen}) + boundary ({BOUNDARY_TOKENS}); "
                     "need room for a unique suffix."
                 )
-        elif self.mode not in ("scenario",):
-            problems.append(f"unknown mode {self.mode!r} (expected 'scenario' or 'hitrate').")
+        elif self.mode not in ("scenario", "hitrate", "slo"):
+            problems.append(f"unknown mode {self.mode!r} (expected 'scenario', 'hitrate', or 'slo').")
+        if self.mode == "slo":
+            if self.slo_ttft_ms is None and self.slo_tpot_ms is None:
+                problems.append("slo: specify at least one of --slo-ttft-ms / --slo-tpot-ms.")
+            if self.slo_max_users < self.slo_min_users:
+                problems.append("slo: slo_max_users must be >= slo_min_users.")
+            if self.slo_step_turns < 1:
+                problems.append("slo: slo_step_turns must be >= 1.")
+            if not (0.0 < self.slo_percentile < 1.0):
+                problems.append("slo: slo_percentile must be in (0, 1).")
         return problems

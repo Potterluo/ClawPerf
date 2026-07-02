@@ -138,6 +138,9 @@ class BenchmarkRunner:
         if self.config.mode == "hitrate":
             await self._run_hitrate()
             return
+        if self.config.mode == "slo":
+            await self._run_slo()
+            return
 
         # 1. Initialize tokenizer
         _ = self.tokenizer_manager.tokenizer
@@ -474,6 +477,289 @@ class BenchmarkRunner:
             rec["error_type"] = classify_error(bd)
             rec["status_code"] = bd.status_code
         return rec
+
+    # ────────────────────────── SLO mode ──────────────────────────
+
+    async def _run_slo(self):
+        """SLO-driven max-concurrency sweep.
+
+        Sweeps the number of concurrent users N (closed-loop: each user sends
+        back-to-back multi-turn requests). At each N, measures P{slo_percentile}
+        of TTFT/TPOT over a fixed turn window (excluding warmup) and checks the
+        SLO. Ramps geometrically to find the knee, then binary-refines the exact
+        max N that still meets the SLO. Reuses the scenario workload.
+        """
+        # 1. Shared infra: tokenizer, EvalScope client, content.
+        _ = self.tokenizer_manager.tokenizer
+        from evalscope.perf.core.http_client import AioHttpClient
+        from evalscope.perf.plugin.api.openai_api import OpenaiPlugin
+        from clawperf.logging_setup import quiet_third_party
+
+        es_args = self.config.to_evalscope_args()
+        es_args.parallel = es_args.parallel[0] if isinstance(es_args.parallel, list) else es_args.parallel
+        es_args.number = es_args.number[0] if isinstance(es_args.number, list) else es_args.number
+        es_args.parallel = self.config.slo_max_users  # pool big enough for the sweep
+        self._api_plugin = OpenaiPlugin(es_args)
+        self._http_client = AioHttpClient(es_args, self._api_plugin)
+        quiet_third_party(self.config.verbose)
+
+        await self._preflight_check()
+
+        # 2. Generate content once. Build a pool of distinct user prefixes
+        #    (capped so generation stays fast) reused across steps via modulo.
+        logger.info("Generating system prefix (%d tokens)...", self.config.system_prefix_tokens)
+        if self.config.system_prefix_source == "random":
+            self._system_prefix_content = await self._gen_off_thread(
+                self.tokenizer_manager.generate_random_content, self.config.system_prefix_tokens
+            )
+        else:
+            self._system_prefix_content = await self._gen_off_thread(
+                self.tokenizer_manager.generate_content_from_file,
+                self.config.system_prefix_source, self.config.system_prefix_tokens,
+            )
+        prefix_pool = min(self.config.slo_max_users, 32)
+        logger.info("Generating %d user prefixes (%d tokens each)...", prefix_pool, self.config.user_prefix_tokens)
+        for uid in range(prefix_pool):
+            self._user_prefix_contents[uid] = await self._gen_off_thread(
+                self.tokenizer_manager.generate_random_content, self.config.user_prefix_tokens
+            )
+            await asyncio.sleep(0)
+        logger.info("Generating per-turn input (%d tokens)...", self.config.input_tokens_per_turn)
+        self._turn_input_content = await self._gen_off_thread(
+            self.tokenizer_manager.generate_random_content, self.config.input_tokens_per_turn
+        )
+
+        setup_time = time.monotonic() - self._setup_start_time
+        logger.info("Setup complete in %.2fs — starting SLO sweep", setup_time)
+        self._bench_start_time = time.monotonic()
+
+        slo_label = self._slo_label()
+        logger.info(
+            "SLO sweep: N %d..%d (%s), %d measured + %d warmup turns/step, SLO=%s",
+            self.config.slo_min_users, self.config.slo_max_users,
+            self.config.slo_step_strategy, self.config.slo_step_turns,
+            self.config.slo_step_warmup_turns, slo_label,
+        )
+
+        # 3. Geometric/linear ramp to find the knee region.
+        steps: List[Dict] = []
+        last_good: Optional[int] = None
+        first_bad: Optional[int] = None
+        n = self.config.slo_min_users
+        while n <= self.config.slo_max_users:
+            step = await self._run_slo_step(n)
+            steps.append(step)
+            if step["slo_met"]:
+                last_good = n
+                n = self._next_n(n)
+            else:
+                first_bad = n
+                break
+
+        # 4. Binary-refine between last_good and first_bad for the exact knee.
+        if last_good is not None and first_bad is not None and first_bad - last_good > 1:
+            logger.info("Refining between N=%d (ok) and N=%d (bad) ...", last_good, first_bad)
+            lo, hi = last_good + 1, first_bad - 1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                step = await self._run_slo_step(mid)
+                steps.append(step)
+                if step["slo_met"]:
+                    last_good = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+
+        bench_time_s = time.monotonic() - self._bench_start_time
+        max_users = last_good if last_good is not None else 0
+        # Sort steps by N for display (ramp + refine are out of order).
+        steps.sort(key=lambda s: s["n_users"])
+
+        await self._finalize_slo(steps, max_users, bench_time_s, setup_time)
+
+    def _slo_label(self) -> str:
+        parts = []
+        if self.config.slo_ttft_ms is not None:
+            parts.append(f"TTFT P{int(self.config.slo_percentile*100)}<={self.config.slo_ttft_ms}ms")
+        if self.config.slo_tpot_ms is not None:
+            parts.append(f"TPOT P{int(self.config.slo_percentile*100)}<={self.config.slo_tpot_ms}ms")
+        if self.config.slo_error_rate is not None:
+            parts.append(f"err<={self.config.slo_error_rate*100:.1f}%")
+        return ", ".join(parts) or "(no SLO)"
+
+    def _slo_verdict(self, p_ttft, p_tpot, err_rate, timed_out) -> bool:
+        """Pure SLO check: does this step's metrics satisfy the configured SLO?"""
+        if timed_out:
+            return False
+        if self.config.slo_ttft_ms is not None and (p_ttft is None or p_ttft > self.config.slo_ttft_ms):
+            return False
+        if self.config.slo_tpot_ms is not None and (p_tpot is None or p_tpot > self.config.slo_tpot_ms):
+            return False
+        if self.config.slo_error_rate is not None and err_rate > self.config.slo_error_rate:
+            return False
+        return True
+
+    def _next_n(self, n: int) -> int:
+        if self.config.slo_step_strategy == "geometric":
+            return max(n + 1, n * 2)
+        return n + 1
+
+    async def _run_slo_step(self, n_users: int) -> Dict:
+        """Run one concurrency step: n_users × (warmup+measure) turns. Returns
+        a step summary with P{percentile} TTFT/TPOT, error rate, SLO verdict."""
+        logger.info("  Step N=%d ...", n_users)
+        if self.config.slo_step_reset_cache:
+            from clawperf.system_metrics import reset_prefix_cache
+            await reset_prefix_cache(self.config.endpoint, self.config.backend)
+
+        total_turns = self.config.slo_step_warmup_turns + self.config.slo_step_turns
+        # Fresh contexts per step (independent conversation state).
+        contexts = {
+            uid: UserContext(
+                user_id=uid,
+                system_prefix=self._system_prefix_content,
+                user_prefix_tokens=self.config.user_prefix_tokens,
+                user_prefix_content=self._user_prefix_contents[uid % len(self._user_prefix_contents)],
+                input_tokens_per_turn=self.config.input_tokens_per_turn,
+                max_context_tokens=self.config.max_context_tokens,
+                compaction_prefix_increment=self.config.compaction_prefix_increment,
+                max_turns=total_turns,
+            )
+            for uid in range(n_users)
+        }
+        records: List[Dict] = []
+
+        async def _one(uid):
+            ctx = contexts[uid]
+            for turn_id in range(1, total_turns + 1):
+                if self._shutdown:
+                    break
+                tr = ctx.prepare_turn(
+                    turn_id=turn_id,
+                    current_input_content=self._turn_input_content,
+                    tokenizer_manager=self.tokenizer_manager,
+                )
+                is_warmup = turn_id <= self.config.slo_step_warmup_turns
+                if tr["context_overflow"]:
+                    records.append({"user_id": uid, "turn_id": turn_id, "success": False,
+                                     "is_warmup": is_warmup, "error_type": "context_overflow"})
+                    continue
+                body = self._api_plugin.build_request(tr["messages"])
+                if body is None:
+                    records.append({"user_id": uid, "turn_id": turn_id, "success": False,
+                                     "is_warmup": is_warmup, "error_type": "build_request_failed"})
+                    continue
+                wall_start = time.monotonic()
+                bd = await self._http_client.post(body)
+                wall_end = time.monotonic()
+                if bd.success:
+                    bd.finalize(self._api_plugin)
+                rec = self._build_turn_record(
+                    uid, turn_id, bd, tr["context_tokens"],
+                    tr["compaction_triggered"], wall_start, wall_end,
+                )
+                rec["is_warmup"] = is_warmup
+                records.append(rec)
+
+        tasks = [asyncio.create_task(_one(uid)) for uid in range(n_users)]
+        timed_out = False
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=self.config.slo_step_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            logger.warning("  Step N=%d timed out after %ds", n_users, self.config.slo_step_timeout_s)
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Stats over measured (non-warmup) turns.
+        measured = [r for r in records if not r.get("is_warmup")]
+        success = [r for r in measured if r.get("success")]
+        ttft_vals = [r["ttft_ms"] for r in success if r.get("ttft_ms") is not None]
+        tpot_vals = [r["tpot_ms"] for r in success if r.get("tpot_ms") is not None]
+        p = self.config.slo_percentile
+        p_ttft = _percentile(ttft_vals, p) if ttft_vals else None
+        p_tpot = _percentile(tpot_vals, p) if tpot_vals else None
+        err_rate = (len(measured) - len(success)) / len(measured) if measured else 1.0
+
+        slo_met = self._slo_verdict(p_ttft, p_tpot, err_rate, timed_out)
+
+        verdict = "OK" if slo_met else ("TIMEOUT" if timed_out else "FAIL")
+        logger.info(
+            "  N=%d: P%d TTFT=%s TPOT=%s err=%.1f%% -> %s",
+            n_users, int(p * 100),
+            f"{p_ttft:.1f}ms" if p_ttft is not None else "N/A",
+            f"{p_tpot:.2f}ms" if p_tpot is not None else "N/A",
+            err_rate * 100, verdict,
+        )
+        return {
+            "n_users": n_users,
+            "p_ttft_ms": p_ttft,
+            "p_tpot_ms": p_tpot,
+            "error_rate": err_rate,
+            "success_count": len(success),
+            "total_count": len(measured),
+            "timed_out": timed_out,
+            "slo_met": slo_met,
+        }
+
+    async def _finalize_slo(self, steps: List[Dict], max_users: int, bench_time_s: float, setup_time_s: float):
+        """Save + print the SLO capacity curve and the max sustained users."""
+        if self._http_client:
+            await self._http_client.client.close()
+
+        summary = {
+            "mode": "slo",
+            "slo": self._slo_label(),
+            "slo_ttft_ms": self.config.slo_ttft_ms,
+            "slo_tpot_ms": self.config.slo_tpot_ms,
+            "slo_percentile": self.config.slo_percentile,
+            "max_sustained_users": max_users,
+            "bench_time_s": round(bench_time_s, 3),
+            "steps_tested": len(steps),
+        }
+        result = {
+            "config": self.config.to_dict(),
+            "summary": summary,
+            "capacity_curve": steps,
+            "timing": {"setup_time_s": round(setup_time_s, 3), "bench_time_s": round(bench_time_s, 3)},
+        }
+        import os
+        out_dir = os.path.dirname(self.config.output)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        with open(self.config.output, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False, default=str)
+        self._append_history(result, setup_time_s, bench_time_s)
+
+        # ── Capacity curve table ──
+        print("\n" + "=" * 70, flush=True)
+        print("ClawPerf - SLO Capacity Sweep Complete", flush=True)
+        print("=" * 70, flush=True)
+        pct_label = f"P{int(self.config.slo_percentile * 100)}"
+        t = PrettyTable()
+        t.field_names = ["Users", f"{pct_label} TTFT", f"{pct_label} TPOT", "Error", "Succ", "SLO"]
+        t.align = "r"
+        t.align["SLO"] = "c"
+        for s in steps:
+            ttft = f"{s['p_ttft_ms']:.1f}ms" if s["p_ttft_ms"] is not None else "N/A"
+            tpot = f"{s['p_tpot_ms']:.2f}ms" if s["p_tpot_ms"] is not None else "N/A"
+            t.add_row([
+                s["n_users"], ttft, tpot,
+                f"{s['error_rate']*100:.1f}%", str(s["success_count"]),
+                "✓" if s["slo_met"] else "✗",
+            ])
+        print("\n  Capacity Curve", flush=True)
+        print(t)
+        print(f"\n  SLO: {self._slo_label()}", flush=True)
+        print(f"  Max sustained users: {max_users}", flush=True)
+        print("=" * 70, flush=True)
+        logger.info("Results saved to: %s", self.config.output)
+
 
     async def _finalize_hitrate(self, prefix_len: int, target: float, bench_time_s: float, setup_time_s: float):
         """Save results + print the hit-rate summary (measured vs target)."""

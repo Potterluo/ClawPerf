@@ -24,10 +24,10 @@ def build_parser() -> argparse.ArgumentParser:
     # ── Mode ──
     g = parser.add_argument_group("Mode")
     g.add_argument("--mode", type=str, default="scenario",
-                   choices=["scenario", "hitrate"],
+                   choices=["scenario", "hitrate", "slo"],
                    help="'scenario' (default): multi-turn long-context workload. "
-                        "'hitrate': controlled prefix-cache hit-rate test "
-                        "(prefill + measure, reports actual vs target hit rate).")
+                        "'hitrate': controlled prefix-cache hit-rate test. "
+                        "'slo': sweep concurrency to find max users meeting TTFT/TPOT SLO.")
 
     # ── Hit-rate mode configuration ──
     g = parser.add_argument_group("Hit-Rate Mode (only with --mode hitrate)")
@@ -53,6 +53,34 @@ def build_parser() -> argparse.ArgumentParser:
                    help="In-flight requests during the measure phase.")
     g.add_argument("--seed", type=int, default=0,
                    help="Reproducibility seed for prompt construction.")
+
+    # ── SLO mode configuration ──
+    g = parser.add_argument_group("SLO Mode (only with --mode slo)")
+    g.add_argument("--slo-ttft-ms", type=float, default=None,
+                   help="Max allowed P{slo_percentile} TTFT (ms).")
+    g.add_argument("--slo-tpot-ms", type=float, default=None,
+                   help="Max allowed P{slo_percentile} TPOT (ms).")
+    g.add_argument("--slo-percentile", type=float, default=0.99,
+                   help="Percentile for the SLO check (0.90/0.95/0.99, default 0.99).")
+    g.add_argument("--slo-error-rate", type=float, default=None,
+                   help="Max allowed error rate (fraction); unchecked if omitted.")
+    g.add_argument("--slo-min-users", type=int, default=1,
+                   help="Starting concurrency for the sweep.")
+    g.add_argument("--slo-max-users", type=int, default=100,
+                   help="Upper bound on concurrency to try.")
+    g.add_argument("--slo-step-strategy", type=str, default="geometric",
+                   choices=["geometric", "linear"],
+                   help="geometric (double each step) or linear (+1).")
+    g.add_argument("--slo-step-turns", type=int, default=5,
+                   help="Measured turns per user per step (excludes warmup).")
+    g.add_argument("--slo-step-warmup-turns", type=int, default=1,
+                   help="Warmup turns per user per step (excluded from SLO stats).")
+    g.add_argument("--slo-step-timeout-s", type=int, default=300,
+                   help="Per-step timeout (abort the step if it exceeds this).")
+    g.add_argument("--slo-step-reset-cache", action="store_true", default=True,
+                   help="Reset the prefix cache between steps (default on).")
+    g.add_argument("--no-slo-step-reset-cache", action="store_false", dest="slo_step_reset_cache",
+                   help="Keep the cache between steps (test sustained pressure).")
 
     # ── User configuration ──
     g = parser.add_argument_group("User Configuration")
@@ -132,6 +160,17 @@ def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
         prefill=args.prefill,
         concurrency=args.concurrency,
         seed=args.seed,
+        slo_ttft_ms=args.slo_ttft_ms,
+        slo_tpot_ms=args.slo_tpot_ms,
+        slo_percentile=args.slo_percentile,
+        slo_error_rate=args.slo_error_rate,
+        slo_min_users=args.slo_min_users,
+        slo_max_users=args.slo_max_users,
+        slo_step_strategy=args.slo_step_strategy,
+        slo_step_turns=args.slo_step_turns,
+        slo_step_warmup_turns=args.slo_step_warmup_turns,
+        slo_step_timeout_s=args.slo_step_timeout_s,
+        slo_step_reset_cache=args.slo_step_reset_cache,
         num_users=args.num_users,
         user_arrival=args.user_arrival,
         system_prefix_tokens=args.system_prefix_tokens,
