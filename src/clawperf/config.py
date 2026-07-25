@@ -18,6 +18,7 @@ class BenchmarkConfig:
     # "scenario" = multi-turn long-context workload (default).
     # "hitrate"  = controlled prefix-cache hit-rate test (prefill + measure).
     # "slo"      = SLO-driven max-concurrency sweep (find max users meeting TTFT/TPOT).
+    # "agent"    = real agent-at-work perf (model runs coding tasks via tool calls).
     mode: str = "scenario"
 
     # ── Hit-rate mode configuration (ignored in other modes) ──
@@ -46,6 +47,18 @@ class BenchmarkConfig:
     slo_step_warmup_turns: int = 1        # warmup turns (excluded from stats)
     slo_step_timeout_s: int = 300         # per-step timeout (abort on overload)
     slo_step_reset_cache: bool = True     # reset cache between steps (reproducible)
+
+    # ── Agent mode configuration (only with --mode agent) ──
+    # The model runs as a real coding agent (read/write/shell, multi-turn) on
+    # N concurrent tasks; we measure latency/tokens/throughput + real prefix
+    # cache hit rate. Purely perf, no accuracy grading.
+    agent_tasks: int = 4              # number of concurrent agent task instances
+    agent_task_file: Optional[str] = None  # custom tasks JSONL (None = use presets)
+    agent_preset: str = "default"     # preset task bank name (currently "default")
+    agent_max_steps: int = 12         # per-task LLM turn cap
+    agent_max_tokens: int = 512       # max generation tokens per turn
+    agent_shell_timeout: int = 30     # tool shell command timeout (seconds)
+    agent_workdir: str = ""           # where to materialize per-task workspaces ("" = temp)
 
     # ── User configuration ──
     num_users: int = 1
@@ -242,8 +255,8 @@ class BenchmarkConfig:
                     f"prefix_len ({plen}) + boundary ({BOUNDARY_TOKENS}); "
                     "need room for a unique suffix."
                 )
-        elif self.mode not in ("scenario", "hitrate", "slo"):
-            problems.append(f"unknown mode {self.mode!r} (expected 'scenario', 'hitrate', or 'slo').")
+        elif self.mode not in ("scenario", "hitrate", "slo", "agent"):
+            problems.append(f"unknown mode {self.mode!r} (expected 'scenario', 'hitrate', 'slo', or 'agent').")
         if self.mode == "slo":
             if self.slo_ttft_ms is None and self.slo_tpot_ms is None:
                 problems.append("slo: specify at least one of --slo-ttft-ms / --slo-tpot-ms.")
@@ -253,4 +266,9 @@ class BenchmarkConfig:
                 problems.append("slo: slo_step_turns must be >= 1.")
             if not (0.0 < self.slo_percentile < 1.0):
                 problems.append("slo: slo_percentile must be in (0, 1).")
+        if self.mode == "agent":
+            if self.agent_tasks < 1:
+                problems.append("agent: agent_tasks must be >= 1.")
+            if self.agent_max_steps < 1:
+                problems.append("agent: agent_max_steps must be >= 1.")
         return problems

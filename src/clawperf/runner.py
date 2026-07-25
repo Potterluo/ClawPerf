@@ -141,6 +141,9 @@ class BenchmarkRunner:
         if self.config.mode == "slo":
             await self._run_slo()
             return
+        if self.config.mode == "agent":
+            await self._run_agent()
+            return
 
         # 1. Initialize tokenizer
         _ = self.tokenizer_manager.tokenizer
@@ -889,6 +892,266 @@ class BenchmarkRunner:
             else:
                 perf.add_row([name] + ["N/A"] * 9)
         print("\n  Performance Results", flush=True)
+        print(perf)
+        print("=" * 70, flush=True)
+
+    # ────────────────────────── Agent mode ──────────────────────────
+
+    async def _run_agent(self):
+        """Real agent-at-work perf: N coding tasks run concurrently as real
+        agents (tool-calling, multi-turn). Measures per-turn TTFT/TPOT/tokens,
+        per-task wall time, and the real prefix-cache hit rate from /metrics."""
+        import os
+        import tempfile
+        from clawperf.agent import Agent, AgentClient
+        from clawperf.agent_tasks import (
+            PRESET_TASKS, build_task_instances, load_tasks_from_file,
+            materialize_workspace,
+        )
+        from clawperf.logging_setup import quiet_third_party
+
+        quiet_third_party(self.config.verbose)
+        # Preflight (reuse the hitrate-style probe via a quick AgentClient call).
+        # The agent mode uses the openai SDK directly (needs tool-calling support
+        # that EvalScope's perf client doesn't provide), so we don't build the
+        # EvalScope client here.
+        logger.info("Agent mode: %d concurrent tasks, max %d steps/task, model=%s",
+                    self.config.agent_tasks, self.config.agent_max_steps, self.config.model)
+
+        # 1. Build the task bank (custom file or presets) + instances.
+        if self.config.agent_task_file:
+            base_tasks = load_tasks_from_file(self.config.agent_task_file)
+        else:
+            base_tasks = list(PRESET_TASKS)
+        tasks = build_task_instances(base_tasks, self.config.agent_tasks)
+
+        # 2. Materialize per-task workspaces.
+        workdir = self.config.agent_workdir or tempfile.mkdtemp(prefix="clawperf_agent_")
+        os.makedirs(workdir, exist_ok=True)
+        task_dirs = []
+        for t in tasks:
+            wd = materialize_workspace(t, workdir)
+            task_dirs.append((t, wd))
+        logger.info("Materialized %d task workspaces under %s", len(task_dirs), workdir)
+
+        # 3. Start metrics snapshot (for prefix-cache hit rate during agent work).
+        if self.config.metrics_endpoint:
+            self.system_poller = SystemMetricsPoller(
+                endpoint=self.config.metrics_endpoint,
+                interval=self.config.metrics_interval,
+                backend=self.config.backend,
+            )
+            if self.config.metrics_samples:
+                await self.system_poller.start()
+            self._metrics_start = await self.system_poller.snapshot()
+            logger.info("Metrics start: %s", self._snapshot_summary(self._metrics_start))
+        if self.config.reset_cache:
+            from clawperf.system_metrics import reset_prefix_cache
+            await reset_prefix_cache(self.config.endpoint, self.config.backend)
+
+        setup_time = time.monotonic() - self._setup_start_time
+        logger.info("Setup complete in %.2fs — starting agent run", setup_time)
+        self._bench_start_time = time.monotonic()
+
+        # 4. Run all agents concurrently.
+        client = AgentClient(
+            endpoint=self.config.endpoint, model=self.config.model,
+            api_key=self.config.api_key, timeout=self.config.request_timeout,
+            max_tokens=self.config.agent_max_tokens,
+        )
+        sem = asyncio.Semaphore(self.config.agent_tasks)
+
+        async def _run_one(task, wd):
+            async with sem:
+                from clawperf.agent import AgentTools
+                toolbox = AgentTools(wd, shell_timeout=self.config.agent_shell_timeout)
+                agent = Agent(client, toolbox, max_steps=self.config.agent_max_steps)
+                logger.info("  Task %d: starting (%d steps max)", task.id, task.max_steps)
+                return await agent.run(task.id, task.prompt)
+
+        results = await asyncio.gather(
+            *[_run_one(t, wd) for t, wd in task_dirs],
+            return_exceptions=True,
+        )
+
+        # Normalize exceptions into failed run results.
+        self._agent_results = []
+        for r in results:
+            if isinstance(r, Exception):
+                logger.error("Agent task failed: %s", r)
+                self._agent_results.append({
+                    "task_id": -1, "error": str(r),
+                    "steps": 0, "finished": False,
+                    "total_wall_s": 0.0, "total_input_tokens": 0,
+                    "total_output_tokens": 0, "turns": [],
+                })
+            else:
+                self._agent_results.append(self._agent_result_to_dict(r))
+
+        # 5. End metrics snapshot.
+        if self.system_poller and self.config.metrics_endpoint:
+            self._metrics_end = await self.system_poller.snapshot()
+            logger.info("Metrics end: %s", self._snapshot_summary(self._metrics_end))
+        if self.system_poller:
+            self._prefix_cache_delta = self.system_poller.compute_prefix_cache_delta(
+                self._metrics_start, self._metrics_end
+            )
+
+        bench_time_s = time.monotonic() - self._bench_start_time
+        # 6. Cleanup + finalize.
+        try:
+            await client._get().close()  # type: ignore
+        except Exception:
+            pass
+        if self.system_poller:
+            await self.system_poller.stop()
+        await self._finalize_agent(bench_time_s, setup_time)
+
+    @staticmethod
+    def _agent_result_to_dict(r) -> dict:
+        return {
+            "task_id": r.task_id,
+            "steps": r.steps,
+            "finished": r.finished,
+            "total_wall_s": round(r.total_wall_s, 3),
+            "total_input_tokens": r.total_input_tokens,
+            "total_output_tokens": r.total_output_tokens,
+            "turns": [
+                {"turn": t.turn, "ttft_ms": t.ttft_ms, "e2e_ms": round(t.e2e_ms, 3),
+                 "input_tokens": t.input_tokens, "output_tokens": t.output_tokens,
+                 "tool_calls": t.tool_calls, "tool_time_ms": round(t.tool_time_ms, 3),
+                 "finish_reason": t.finish_reason}
+                for t in r.turns
+            ],
+        }
+
+    async def _finalize_agent(self, bench_time_s: float, setup_time_s: float):
+        """Save + print the agent perf summary."""
+        results = self._agent_results
+        ok = [r for r in results if not r.get("error")]
+        all_turns = [t for r in ok for t in r["turns"]]
+        success_turns = [t for t in all_turns if t.get("ttft_ms") is not None]
+        total_in = sum(r["total_input_tokens"] for r in ok)
+        total_out = sum(r["total_output_tokens"] for r in ok)
+        measured = None
+        if self._prefix_cache_delta:
+            measured = self._prefix_cache_delta.get("prefix_cache_token_hit_rate")
+
+        summary = {
+            "mode": "agent",
+            "tasks_run": len(results),
+            "tasks_finished": sum(1 for r in ok if r["finished"]),
+            "total_steps": sum(r["steps"] for r in ok),
+            "total_input_tokens": total_in,
+            "total_output_tokens": total_out,
+            "bench_time_s": round(bench_time_s, 3),
+            "task_throughput": len(ok) / bench_time_s if bench_time_s > 0 else 0,
+            "measured_prefix_cache_hit_rate": measured,
+        }
+        for key, src in (("ttft", "ttft_ms"), ("e2e_latency", "e2e_ms"), ("tpot", None)):
+            if src:
+                vals = [t[src] for t in success_turns if t.get(src) is not None]
+            else:
+                # tpot = (e2e - ttft) / max(output_tokens - 1, 1) per turn, in ms
+                vals = []
+                for t in success_turns:
+                    ot = t.get("output_tokens") or 0
+                    if t.get("e2e_ms") and t.get("ttft_ms") and ot > 1:
+                        vals.append((t["e2e_ms"] - t["ttft_ms"]) / (ot - 1))
+            if vals:
+                summary[key] = _percentiles(vals)
+
+        result = {
+            "config": self.config.to_dict(),
+            "summary": summary,
+            "tasks": results,
+            "timing": {"setup_time_s": round(setup_time_s, 3), "bench_time_s": round(bench_time_s, 3)},
+        }
+        if self._prefix_cache_delta:
+            summary["prefix_cache"] = self._prefix_cache_delta
+        import os
+        out_dir = os.path.dirname(self.config.output)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        with open(self.config.output, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False, default=str)
+        self._append_history(result, setup_time_s, bench_time_s)
+        self._print_agent_summary(summary, bench_time_s, setup_time_s, measured)
+
+    def _print_agent_summary(self, summary, bench_time_s, setup_time_s, measured):
+        results = self._agent_results
+        ok = [r for r in results if not r.get("error")]
+        print("\n" + "=" * 70, flush=True)
+        print("ClawPerf - Agent-at-Work Perf Complete", flush=True)
+        print("=" * 70, flush=True)
+
+        ct = PrettyTable()
+        ct.field_names = ["Metric", "Value"]
+        ct.align["Metric"] = "l"
+        ct.align["Value"] = "r"
+        ct.add_row(["Setup Time", f"{setup_time_s:.2f} s"])
+        ct.add_row(["Duration", f"{bench_time_s:.2f} s"])
+        ct.add_row(["Tasks Run", str(len(results))])
+        ct.add_row(["Tasks Finished (model said done)", str(summary["tasks_finished"])])
+        ct.add_row(["Total Agent Steps", str(summary["total_steps"])])
+        ct.add_row(["Concurrent Tasks", str(self.config.agent_tasks)])
+        ct.add_row(["Max Steps/Task", str(self.config.agent_max_steps)])
+        ct.add_row(["Total Input Tokens", f"{summary['total_input_tokens']:,}"])
+        ct.add_row(["Total Output Tokens", f"{summary['total_output_tokens']:,}"])
+        ct.add_row(["Task Throughput", f"{summary['task_throughput']:.4f} tasks/s"])
+        ct.add_row(["Output Token Throughput",
+                    f"{summary['total_output_tokens'] / bench_time_s:.2f} tok/s" if bench_time_s > 0 else "N/A"])
+        if measured is not None:
+            ct.add_row(["MEASURED Prefix Cache Hit Rate", f"{measured * 100:.2f}%"])
+        elif self._prefix_cache_delta and self._prefix_cache_delta.get("prefix_cache_counter_reset"):
+            ct.add_row(["MEASURED Prefix Cache Hit Rate", "N/A (counter reset)"])
+        print("\n  Agent Perf Results", flush=True)
+        print(ct)
+
+        # per-task table
+        ut = PrettyTable()
+        ut.field_names = ["Task", "Steps", "Finished", "Wall (s)", "In Tok", "Out Tok"]
+        ut.align = "r"
+        ut.align["Task"] = "l"
+        for r in results:
+            err = r.get("error")
+            ut.add_row([
+                f"task {r.get('task_id', -1)}" if r.get("task_id", -1) >= 0 else "error",
+                str(r.get("steps", 0)),
+                "yes" if r.get("finished") else ("ERR" if err else "no"),
+                f"{r.get('total_wall_s', 0):.2f}",
+                f"{r.get('total_input_tokens', 0):,}",
+                f"{r.get('total_output_tokens', 0):,}",
+            ])
+            if err:
+                ut.add_row(["", "", "", f"err: {err[:60]}", "", ""])
+        print("\n  Per-Task Results", flush=True)
+        print(ut)
+
+        # turn-level percentiles
+        all_turns = [t for r in ok for t in r["turns"]]
+        success_turns = [t for t in all_turns if t.get("ttft_ms") is not None]
+        perf = PrettyTable()
+        perf.field_names = ["Metric", "Avg", "Min", "P25", "P50", "P75", "P90", "P99", "Max", "N"]
+        perf.align["Metric"] = "l"
+        perf.align = "r"
+        ttft_vals = [t["ttft_ms"] for t in success_turns if t.get("ttft_ms") is not None]
+        e2e_vals = [t["e2e_ms"] for t in success_turns if t.get("e2e_ms") is not None]
+        for name, pct in (("TTFT", _percentiles(ttft_vals)), ("E2E Latency", _percentiles(e2e_vals))):
+            if pct:
+                row = [name]
+                for key in ("avg", "min", "P25", "P50", "P75", "P90", "P99", "max", "N"):
+                    v = pct.get(key)
+                    if key == "N":
+                        row.append(str(int(v)))
+                    elif v is not None:
+                        row.append(_fmt_val(v, "ms", 2))
+                    else:
+                        row.append("N/A")
+                perf.add_row(row)
+            else:
+                perf.add_row([name] + ["N/A"] * 9)
+        print("\n  Per-Turn Latency (ms)", flush=True)
         print(perf)
         print("=" * 70, flush=True)
 

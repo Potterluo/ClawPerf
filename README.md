@@ -151,6 +151,35 @@ How it works:
 - Output: a **capacity curve** (N vs P99 TTFT/TPOT/error/SLO-met) and the
   `Max sustained users` verdict.
 
+### Agent-at-work mode (real coding-agent perf)
+
+Run the model as a **real coding agent** — it reads/writes files and runs shell
+commands via OpenAI function-calling, multi-turn, with growing context. N tasks
+run concurrently; we measure per-turn TTFT/TPOT/tokens, per-task wall time, and
+the **real prefix-cache hit rate** from `/metrics`. Purely performance, no
+accuracy grading. Requires the backend to support tool-calling (e.g. Qwen/GLM
+on vLLM).
+
+```bash
+pip install clawperf[agent]   # installs the openai SDK used by agent mode
+
+clawperf --mode agent \
+  --endpoint http://localhost:8000/v1/chat/completions \
+  --model qwen3-32b --tokenizer qwen3-32b \
+  --agent-tasks 10 \               # 10 concurrent agent task instances
+  --agent-max-steps 12 \           # per-task LLM turn cap
+  --agent-max-tokens 512 \         # max generation per turn
+  --metrics-endpoint http://localhost:8000/metrics --backend vllm \
+  --reset-cache
+```
+
+Tasks: the built-in preset bank (small coding tasks: fix a bug, add a function,
+edit a config) is used by default; or supply your own with `--agent-task-file
+tasks.jsonl` (one `{"prompt", "workspace": {"path":"content"}, "max_steps"}`
+per line). Each task instance gets its own workspace dir (concurrent agents
+never collide). Output: per-task table (steps/finished/wall/tokens) + per-turn
+TTFT percentiles + measured prefix-cache hit rate.
+
 ## CLI Options
 
 ### User Configuration

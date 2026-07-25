@@ -24,10 +24,11 @@ def build_parser() -> argparse.ArgumentParser:
     # ── Mode ──
     g = parser.add_argument_group("Mode")
     g.add_argument("--mode", type=str, default="scenario",
-                   choices=["scenario", "hitrate", "slo"],
+                   choices=["scenario", "hitrate", "slo", "agent"],
                    help="'scenario' (default): multi-turn long-context workload. "
                         "'hitrate': controlled prefix-cache hit-rate test. "
-                        "'slo': sweep concurrency to find max users meeting TTFT/TPOT SLO.")
+                        "'slo': sweep concurrency to find max users meeting TTFT/TPOT SLO. "
+                        "'agent': real agent-at-work perf (model runs coding tasks via tool calls).")
 
     # ── Hit-rate mode configuration ──
     g = parser.add_argument_group("Hit-Rate Mode (only with --mode hitrate)")
@@ -81,6 +82,24 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Reset the prefix cache between steps (default on).")
     g.add_argument("--no-slo-step-reset-cache", action="store_false", dest="slo_step_reset_cache",
                    help="Keep the cache between steps (test sustained pressure).")
+
+    # ── Agent mode configuration ──
+    g = parser.add_argument_group("Agent Mode (only with --mode agent)")
+    g.add_argument("--agent-tasks", type=int, default=4,
+                   help="Number of concurrent agent task instances to run.")
+    g.add_argument("--agent-task-file", type=str, default=None,
+                   help="Custom tasks JSONL file (one {prompt,workspace,max_steps} per line). "
+                        "Omit to use the built-in preset tasks.")
+    g.add_argument("--agent-preset", type=str, default="default",
+                   help="Preset task bank name (default).")
+    g.add_argument("--agent-max-steps", type=int, default=12,
+                   help="Per-task LLM turn cap.")
+    g.add_argument("--agent-max-tokens", type=int, default=512,
+                   help="Max generation tokens per turn.")
+    g.add_argument("--agent-shell-timeout", type=int, default=30,
+                   help="Shell-tool command timeout (seconds).")
+    g.add_argument("--agent-workdir", type=str, default="",
+                   help="Base dir for per-task workspaces (default: a temp dir).")
 
     # ── User configuration ──
     g = parser.add_argument_group("User Configuration")
@@ -171,6 +190,13 @@ def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
         slo_step_warmup_turns=args.slo_step_warmup_turns,
         slo_step_timeout_s=args.slo_step_timeout_s,
         slo_step_reset_cache=args.slo_step_reset_cache,
+        agent_tasks=args.agent_tasks,
+        agent_task_file=args.agent_task_file,
+        agent_preset=args.agent_preset,
+        agent_max_steps=args.agent_max_steps,
+        agent_max_tokens=args.agent_max_tokens,
+        agent_shell_timeout=args.agent_shell_timeout,
+        agent_workdir=args.agent_workdir,
         num_users=args.num_users,
         user_arrival=args.user_arrival,
         system_prefix_tokens=args.system_prefix_tokens,
