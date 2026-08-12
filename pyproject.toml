@@ -37,9 +37,9 @@ agent = ["openai>=1.0"]
 dev = ["pytest>=7", "pytest-asyncio>=0.21", "ruff>=0.1", "openai>=1.0"]
 
 [project.urls]
-Homepage = "https://github.com/Potterluo/ClawPerf"
-Repository = "https://github.com/Potterluo/ClawPerf"
-Issues = "https://github.com/Potterluo/ClawPerf/issues"
+Homepage = "https://github.com/ucm-system/ClawPerf"
+Repository = "https://github.com/ucm-system/ClawPerf"
+Issues = "https://github.com/ucm-system/ClawPerf/issues"
 
 [project.scripts]
 clawperf = "clawperf.cli:main"

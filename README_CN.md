@@ -2,8 +2,8 @@
 
 [![PyPI 版本](https://img.shields.io/pypi/v/clawperf.svg)](https://pypi.org/project/clawperf/)
 [![Python 版本](https://img.shields.io/pypi/pyversions/clawperf.svg)](https://pypi.org/project/clawperf/)
-[![许可证](https://img.shields.io/pypi/l/clawperf.svg)](https://github.com/Potterluo/ClawPerf/blob/main/LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/Potterluo/ClawPerf.svg)](https://github.com/Potterluo/ClawPerf)
+[![许可证](https://img.shields.io/pypi/l/clawperf.svg)](https://github.com/ucm-system/ClawPerf/blob/main/LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/ucm-system/ClawPerf.svg)](https://github.com/ucm-system/ClawPerf)
 
 面向 LLM Serving 后端（vLLM、SGLang、MindIE）的多轮长上下文性能基准测试工具。
 
@@ -70,7 +70,7 @@ pip install clawperf[dev]
 从源码安装（推荐开发使用）：
 
 ```bash
-git clone https://github.com/Potterluo/ClawPerf.git
+git clone https://github.com/ucm-system/ClawPerf.git
 cd ClawPerf
 uv sync --extra dev --extra mock-server
 ```

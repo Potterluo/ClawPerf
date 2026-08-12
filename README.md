@@ -2,8 +2,8 @@
 
 [![PyPI Version](https://img.shields.io/pypi/v/clawperf.svg)](https://pypi.org/project/clawperf/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/clawperf.svg)](https://pypi.org/project/clawperf/)
-[![License](https://img.shields.io/pypi/l/clawperf.svg)](https://github.com/Potterluo/ClawPerf/blob/main/LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/Potterluo/ClawPerf.svg)](https://github.com/Potterluo/ClawPerf)
+[![License](https://img.shields.io/pypi/l/clawperf.svg)](https://github.com/ucm-system/ClawPerf/blob/main/LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/ucm-system/ClawPerf.svg)](https://github.com/ucm-system/ClawPerf)
 
 Performance benchmarking tool for LLM Serving backends with multi-turn long-context workloads.
 
@@ -41,7 +41,7 @@ pip install clawperf[dev]
 Install from source (recommended for development):
 
 ```bash
-git clone https://github.com/Potterluo/ClawPerf.git
+git clone https://github.com/ucm-system/ClawPerf.git
 cd ClawPerf
 uv sync --extra dev --extra mock-server
 ```
